@@ -83,9 +83,6 @@ struct flux_ctx {
     char model_name[64];
     char model_version[32];
     char model_dir[512];  /* For reloading text encoder if released */
-
-    /* State */
-    int verbose;
 };
 
 /* Global error message */
@@ -130,47 +127,25 @@ flux_ctx *flux_load_dir(const char *model_dir) {
     /* Load VAE */
     snprintf(path, sizeof(path), "%s/vae/diffusion_pytorch_model.safetensors", model_dir);
     if (file_exists(path)) {
-        fprintf(stderr, "Loading VAE from %s\n", path);
         safetensors_file_t *sf = safetensors_open(path);
         if (sf) {
             ctx->vae = flux_vae_load_safetensors(sf);
             safetensors_close(sf);
-            if (!ctx->vae) {
-                fprintf(stderr, "Warning: Failed to load VAE weights\n");
-            } else {
-                fprintf(stderr, "  VAE loaded successfully\n");
-            }
-        } else {
-            fprintf(stderr, "Warning: Cannot open VAE file\n");
         }
     }
 
     /* Load transformer */
     snprintf(path, sizeof(path), "%s/transformer/diffusion_pytorch_model.safetensors", model_dir);
     if (file_exists(path)) {
-        fprintf(stderr, "Loading transformer from %s\n", path);
         safetensors_file_t *sf = safetensors_open(path);
         if (sf) {
             ctx->transformer = flux_transformer_load_safetensors(sf);
             safetensors_close(sf);
-            if (!ctx->transformer) {
-                fprintf(stderr, "Warning: Failed to load transformer weights\n");
-            } else {
-                fprintf(stderr, "  Transformer loaded successfully\n");
-            }
-        } else {
-            fprintf(stderr, "Warning: Cannot open transformer file\n");
         }
     }
 
     /* Load Qwen3 text encoder */
-    fprintf(stderr, "Loading Qwen3 text encoder from %s\n", model_dir);
     ctx->qwen3_encoder = qwen3_encoder_load(model_dir);
-    if (ctx->qwen3_encoder) {
-        fprintf(stderr, "  Qwen3 text encoder loaded successfully\n");
-    } else {
-        fprintf(stderr, "  Warning: Failed to load Qwen3 text encoder\n");
-    }
 
     /* Verify required components are loaded */
     if (!ctx->vae) {
@@ -185,11 +160,7 @@ flux_ctx *flux_load_dir(const char *model_dir) {
         return NULL;
     }
 
-    /* Warn about text encoder */
-    if (!ctx->qwen3_encoder) {
-        fprintf(stderr, "\nWARNING: Text encoder not loaded!\n");
-        fprintf(stderr, "  Images will be generated with empty text conditioning.\n");
-    }
+    /* Note: If text encoder failed to load, images will use empty conditioning */
 
     /* Initialize RNG */
     flux_rng_seed((uint64_t)time(NULL));
@@ -213,7 +184,6 @@ void flux_release_text_encoder(flux_ctx *ctx) {
 
     qwen3_encoder_free(ctx->qwen3_encoder);
     ctx->qwen3_encoder = NULL;
-    fprintf(stderr, "Text encoder released (~8GB freed)\n");
 }
 
 /* Get transformer for debugging */
@@ -233,8 +203,9 @@ float *flux_encode_text(flux_ctx *ctx, const char *prompt, int *out_seq_len) {
 
     /* Reload encoder if it was released */
     if (!ctx->qwen3_encoder && ctx->model_dir[0]) {
-        fprintf(stderr, "Reloading text encoder...\n");
+        if (flux_phase_callback) flux_phase_callback("reloading encoder", 0);
         ctx->qwen3_encoder = qwen3_encoder_load(ctx->model_dir);
+        if (flux_phase_callback) flux_phase_callback("reloading encoder", 1);
         if (!ctx->qwen3_encoder) {
             fprintf(stderr, "Warning: Failed to reload text encoder\n");
         }
@@ -246,8 +217,10 @@ float *flux_encode_text(flux_ctx *ctx, const char *prompt, int *out_seq_len) {
         return (float *)calloc(QWEN3_MAX_SEQ_LEN * QWEN3_TEXT_DIM, sizeof(float));
     }
 
-    /* Use Qwen3 encoder (handles tokenization internally) */
+    /* Encode text using Qwen3 */
+    if (flux_phase_callback) flux_phase_callback("encoding text", 0);
     float *embeddings = qwen3_encode_text(ctx->qwen3_encoder, prompt);
+    if (flux_phase_callback) flux_phase_callback("encoding text", 1);
 
     *out_seq_len = QWEN3_MAX_SEQ_LEN;  /* Always 512 */
     return embeddings;
@@ -283,12 +256,6 @@ flux_image *flux_generate(flux_ctx *ctx, const char *prompt,
     p.height = (p.height / 16) * 16;
     if (p.width < 64) p.width = 64;
     if (p.height < 64) p.height = 64;
-
-    if (ctx->verbose) {
-        fprintf(stderr, "Generating %dx%d image with %d steps\n",
-                p.width, p.height, p.num_steps);
-        fprintf(stderr, "Prompt: %s\n", prompt);
-    }
 
     /* Encode text */
     int text_seq;
@@ -335,29 +302,9 @@ flux_image *flux_generate(flux_ctx *ctx, const char *prompt,
     /* Decode latent to image */
     flux_image *img = NULL;
     if (ctx->vae) {
+        if (flux_phase_callback) flux_phase_callback("decoding image", 0);
         img = flux_vae_decode(ctx->vae, latent, 1, latent_h, latent_w);
-    } else {
-        /* Create placeholder image if no VAE */
-        img = flux_image_create(p.width, p.height, 3);
-        if (img) {
-            /* Fill with gradient based on latent */
-            for (int y = 0; y < p.height; y++) {
-                for (int x = 0; x < p.width; x++) {
-                    int lx = x / 16;
-                    int ly = y / 16;
-                    if (lx < latent_w && ly < latent_h) {
-                        int idx = ly * latent_w + lx;
-                        float v = latent[idx];
-                        v = (v + 3.0f) / 6.0f;  /* Normalize roughly to [0,1] */
-                        if (v < 0) v = 0;
-                        if (v > 1) v = 1;
-                        img->data[(y * p.width + x) * 3 + 0] = (uint8_t)(v * 255);
-                        img->data[(y * p.width + x) * 3 + 1] = (uint8_t)(v * 200);
-                        img->data[(y * p.width + x) * 3 + 2] = (uint8_t)(v * 150);
-                    }
-                }
-            }
-        }
+        if (flux_phase_callback) flux_phase_callback("decoding image", 1);
     }
 
     free(latent);
@@ -398,11 +345,6 @@ flux_image *flux_generate_with_embeddings(flux_ctx *ctx,
     if (p.width < 64) p.width = 64;
     if (p.height < 64) p.height = 64;
 
-    if (ctx->verbose) {
-        fprintf(stderr, "Generating %dx%d with external embeddings (%d tokens)\n",
-                p.width, p.height, text_seq);
-    }
-
     /* Compute latent dimensions */
     int latent_h = p.height / 16;
     int latent_w = p.width / 16;
@@ -414,14 +356,6 @@ flux_image *flux_generate_with_embeddings(flux_ctx *ctx,
 
     /* Get official FLUX.2 schedule (matches Python) */
     float *schedule = flux_official_schedule(p.num_steps, image_seq_len);
-
-    if (ctx->verbose) {
-        fprintf(stderr, "Schedule: [");
-        for (int i = 0; i <= p.num_steps; i++) {
-            fprintf(stderr, "%.4f%s", schedule[i], i < p.num_steps ? ", " : "");
-        }
-        fprintf(stderr, "]\n");
-    }
 
     /* Sample */
     float *latent = flux_sample_euler(
@@ -445,7 +379,9 @@ flux_image *flux_generate_with_embeddings(flux_ctx *ctx,
     /* Decode latent to image */
     flux_image *img = NULL;
     if (ctx->vae) {
+        if (flux_phase_callback) flux_phase_callback("decoding image", 0);
         img = flux_vae_decode(ctx->vae, latent, 1, latent_h, latent_w);
+        if (flux_phase_callback) flux_phase_callback("decoding image", 1);
     } else {
         set_error("No VAE loaded");
         free(latent);
@@ -498,25 +434,12 @@ flux_image *flux_generate_with_embeddings_and_noise(flux_ctx *ctx,
         return NULL;
     }
 
-    if (ctx->verbose) {
-        fprintf(stderr, "Generating %dx%d with external embeddings (%d tokens) and noise\n",
-                p.width, p.height, text_seq);
-    }
-
     /* Copy external noise */
     float *z = (float *)malloc(expected_noise_size * sizeof(float));
     memcpy(z, noise, expected_noise_size * sizeof(float));
 
     /* Get official FLUX.2 schedule (matches Python) */
     float *schedule = flux_official_schedule(p.num_steps, image_seq_len);
-
-    if (ctx->verbose) {
-        fprintf(stderr, "Schedule: [");
-        for (int i = 0; i <= p.num_steps; i++) {
-            fprintf(stderr, "%.4f%s", schedule[i], i < p.num_steps ? ", " : "");
-        }
-        fprintf(stderr, "]\n");
-    }
 
     /* Sample */
     float *latent = flux_sample_euler(
@@ -540,7 +463,9 @@ flux_image *flux_generate_with_embeddings_and_noise(flux_ctx *ctx,
     /* Decode latent to image */
     flux_image *img = NULL;
     if (ctx->vae) {
+        if (flux_phase_callback) flux_phase_callback("decoding image", 0);
         img = flux_vae_decode(ctx->vae, latent, 1, latent_h, latent_w);
+        if (flux_phase_callback) flux_phase_callback("decoding image", 1);
     } else {
         set_error("No VAE loaded");
         free(latent);
@@ -676,7 +601,9 @@ flux_image *flux_img2img(flux_ctx *ctx, const char *prompt,
     /* Decode */
     flux_image *result = NULL;
     if (ctx->vae) {
+        if (flux_phase_callback) flux_phase_callback("decoding image", 0);
         result = flux_vae_decode(ctx->vae, latent, 1, latent_h, latent_w);
+        if (flux_phase_callback) flux_phase_callback("decoding image", 1);
     }
 
     free(latent);
@@ -739,7 +666,10 @@ float *flux_encode_image(flux_ctx *ctx, const flux_image *img,
 flux_image *flux_decode_latent(flux_ctx *ctx, const float *latent,
                                int latent_h, int latent_w) {
     if (!ctx || !latent || !ctx->vae) return NULL;
-    return flux_vae_decode(ctx->vae, latent, 1, latent_h, latent_w);
+    if (flux_phase_callback) flux_phase_callback("decoding image", 0);
+    flux_image *img = flux_vae_decode(ctx->vae, latent, 1, latent_h, latent_w);
+    if (flux_phase_callback) flux_phase_callback("decoding image", 1);
+    return img;
 }
 
 float *flux_denoise_step(flux_ctx *ctx, const float *z, float t,

@@ -30,6 +30,7 @@
 /* Progress callbacks - set by caller before inference */
 flux_substep_callback_t flux_substep_callback = NULL;
 flux_step_callback_t flux_step_callback = NULL;
+flux_phase_callback_t flux_phase_callback = NULL;
 
 /* ========================================================================
  * Random Number Generator (xoshiro256**)

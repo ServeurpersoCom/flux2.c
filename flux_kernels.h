@@ -308,4 +308,12 @@ typedef void (*flux_step_callback_t)(int step, int total);
 extern flux_substep_callback_t flux_substep_callback;
 extern flux_step_callback_t flux_step_callback;
 
+/*
+ * Phase callback - called at major phase boundaries.
+ * phase: descriptive name ("encoding text", "decoding image", etc.)
+ * done: 0 when starting, 1 when finished
+ */
+typedef void (*flux_phase_callback_t)(const char *phase, int done);
+extern flux_phase_callback_t flux_phase_callback;
+
 #endif /* FLUX_KERNELS_H */
