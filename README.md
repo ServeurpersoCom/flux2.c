@@ -22,18 +22,20 @@ pip install huggingface_hub
 python download_model.py
 ```
 
-This downloads the VAE and transformer (~8GB) to `./flux-klein-model`.
+This downloads the VAE, transformer, and text encoder (~16GB total) to `./flux-klein-model`.
 
 ## Usage
 
+Generate an image from a text prompt:
+
 ```bash
-./flux -d flux-klein-model -e embeddings.bin -o output.png
+./flux -d flux-klein-model -p "A fluffy orange cat sitting on a windowsill" -o cat.png
 ```
 
 Options:
 - `-d PATH` - Model directory (required)
-- `-p TEXT` - Text prompt (requires text encoder, see limitations)
-- `-e PATH` - Pre-computed text embeddings file
+- `-p TEXT` - Text prompt for image generation
+- `-e PATH` - Pre-computed text embeddings file (alternative to `-p`)
 - `-o PATH` - Output image path
 - `-W N` - Width (default: 1024)
 - `-H N` - Height (default: 1024)
@@ -41,22 +43,19 @@ Options:
 - `-S N` - Random seed
 - `-v` - Verbose output with progress
 
+## Components
+
+- **Transformer**: FLUX DiT architecture (5 double blocks, 20 single blocks)
+- **VAE**: AutoencoderKL for latent decoding
+- **Text Encoder**: Qwen3-4B (2560 hidden dim, 36 layers)
+
+All components are implemented in pure C with BLAS acceleration.
+
 ## Current Limitations
 
 **Maximum resolution**: 1024x1024 pixels. Higher resolutions require prohibitive memory for the attention mechanisms (VAE attention alone needs ~17GB for the scores matrix at 2048x2048).
 
-**No text encoder**: The Qwen3 text encoder (~8GB) is not yet implemented. To generate images, you must provide pre-computed text embeddings via the `-e` option. These can be generated using the Python diffusers library:
-
-```python
-from diffusers import FluxPipeline
-import numpy as np
-
-pipe = FluxPipeline.from_pretrained("black-forest-labs/FLUX.2-klein-4B")
-prompt_embeds, pooled_prompt_embeds, text_ids = pipe.encode_prompt(
-    "your prompt here", max_sequence_length=512
-)
-# Save prompt_embeds as binary file for use with -e option
-```
+**Memory requirements**: The full model requires ~16GB RAM (transformer ~4GB, VAE ~300MB, text encoder ~8GB).
 
 ## License
 

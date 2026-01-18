@@ -8,6 +8,7 @@
 #include "flux.h"
 #include "flux_kernels.h"
 #include "flux_safetensors.h"
+#include "flux_qwen3.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -21,7 +22,6 @@
 typedef struct flux_tokenizer flux_tokenizer;
 typedef struct flux_vae flux_vae_t;
 typedef struct flux_transformer flux_transformer_t;
-typedef struct flux_text_encoder flux_text_encoder_t;
 
 /* Internal function declarations */
 extern flux_tokenizer *flux_tokenizer_load(const char *path);
@@ -57,75 +57,10 @@ extern float *flux_linear_schedule(int num_steps);
 extern float *flux_init_noise(int batch, int channels, int h, int w, int64_t seed);
 
 /* ========================================================================
- * Text Encoder (Simplified)
+ * Text Encoder (Qwen3)
  * ======================================================================== */
 
-/*
- * For the klein 4B model, we use a simplified text encoder.
- * The full model would use Mistral 3.1, but that's ~24B parameters.
- *
- * This simplified version uses a smaller transformer for text embedding,
- * or can load pre-computed embeddings.
- */
-
-struct flux_text_encoder {
-    int hidden_size;        /* 2560 (such that 3 * 2560 = 7680) */
-    int num_layers;         /* e.g., 12 */
-    int num_heads;          /* e.g., 20 */
-    int vocab_size;
-    int max_seq_len;
-
-    /* Embeddings */
-    float *token_embeddings;
-    float *position_embeddings;
-
-    /* Transformer layers */
-    void *layers;  /* Placeholder for actual layer weights */
-
-    /* Output: stack 3 layers and concatenate */
-    int output_layers[3];
-
-    /* Working memory */
-    float *hidden;
-};
-
-/* Simple text encoder forward pass */
-static float *text_encoder_forward(flux_text_encoder_t *enc,
-                                   const int *tokens, int seq_len) {
-    if (!enc) {
-        /* Return zero embeddings for testing
-         * Without T5-XXL text encoder, we can't properly encode text.
-         * Zero embeddings will test if denoising works.
-         */
-        float *emb = (float *)calloc(seq_len * FLUX_TEXT_DIM, sizeof(float));
-        return emb;
-    }
-
-    /* TODO: Implement full text encoder forward pass */
-    /* For now, just use token embeddings */
-    float *emb = (float *)malloc(seq_len * FLUX_TEXT_DIM * sizeof(float));
-
-    for (int s = 0; s < seq_len; s++) {
-        int token = tokens[s];
-        if (token < 0 || token >= enc->vocab_size) token = 0;
-
-        /* Get embedding and replicate to text_dim */
-        for (int d = 0; d < FLUX_TEXT_DIM; d++) {
-            int src_d = d % enc->hidden_size;
-            emb[s * FLUX_TEXT_DIM + d] = enc->token_embeddings[token * enc->hidden_size + src_d];
-        }
-    }
-
-    return emb;
-}
-
-static void text_encoder_free(flux_text_encoder_t *enc) {
-    if (!enc) return;
-    free(enc->token_embeddings);
-    free(enc->position_embeddings);
-    free(enc->hidden);
-    free(enc);
-}
+/* Qwen3 text encoder is implemented in flux_qwen3.c */
 
 /* ========================================================================
  * Main Context Structure
@@ -134,7 +69,7 @@ static void text_encoder_free(flux_text_encoder_t *enc) {
 struct flux_ctx {
     /* Components */
     flux_tokenizer *tokenizer;
-    flux_text_encoder_t *text_encoder;
+    qwen3_encoder_t *qwen3_encoder;
     flux_vae_t *vae;
     flux_transformer_t *transformer;
 
@@ -226,13 +161,13 @@ flux_ctx *flux_load_dir(const char *model_dir) {
         }
     }
 
-    /* Load tokenizer vocabulary */
-    snprintf(path, sizeof(path), "%s/tokenizer/vocab.json", model_dir);
-    if (file_exists(path)) {
-        ctx->tokenizer = flux_tokenizer_load(path);
-        if (ctx->tokenizer) {
-            fprintf(stderr, "  Tokenizer loaded\n");
-        }
+    /* Load Qwen3 text encoder */
+    fprintf(stderr, "Loading Qwen3 text encoder from %s\n", model_dir);
+    ctx->qwen3_encoder = qwen3_encoder_load(model_dir);
+    if (ctx->qwen3_encoder) {
+        fprintf(stderr, "  Qwen3 text encoder loaded successfully\n");
+    } else {
+        fprintf(stderr, "  Warning: Failed to load Qwen3 text encoder\n");
     }
 
     /* Verify required components are loaded */
@@ -249,11 +184,9 @@ flux_ctx *flux_load_dir(const char *model_dir) {
     }
 
     /* Warn about text encoder */
-    if (!ctx->text_encoder) {
+    if (!ctx->qwen3_encoder) {
         fprintf(stderr, "\nWARNING: Text encoder not loaded!\n");
         fprintf(stderr, "  Images will be generated with empty text conditioning.\n");
-        fprintf(stderr, "  For proper text-to-image generation, the Qwen3 text encoder\n");
-        fprintf(stderr, "  needs to be implemented (8GB model in text_encoder/).\n\n");
     }
 
     /* Initialize RNG */
@@ -266,7 +199,7 @@ void flux_free(flux_ctx *ctx) {
     if (!ctx) return;
 
     flux_tokenizer_free(ctx->tokenizer);
-    text_encoder_free(ctx->text_encoder);
+    qwen3_encoder_free(ctx->qwen3_encoder);
     flux_vae_free(ctx->vae);
     flux_transformer_free(ctx->transformer);
 
@@ -288,31 +221,16 @@ float *flux_encode_text(flux_ctx *ctx, const char *prompt, int *out_seq_len) {
         return NULL;
     }
 
-    /* Tokenize */
-    int num_tokens;
-    int *tokens;
-
-    if (ctx->tokenizer) {
-        tokens = flux_tokenize(ctx->tokenizer, prompt, &num_tokens, FLUX_MAX_SEQ_LEN);
-    } else {
-        /* Simple character-level tokenization as fallback */
-        int len = strlen(prompt);
-        num_tokens = (len > FLUX_MAX_SEQ_LEN - 2) ? FLUX_MAX_SEQ_LEN - 2 : len;
-        tokens = (int *)malloc((num_tokens + 2) * sizeof(int));
-        tokens[0] = 1;  /* BOS */
-        for (int i = 0; i < num_tokens; i++) {
-            tokens[i + 1] = (unsigned char)prompt[i];
-        }
-        tokens[num_tokens + 1] = 2;  /* EOS */
-        num_tokens += 2;
+    if (!ctx->qwen3_encoder) {
+        /* Return zero embeddings if encoder not loaded */
+        *out_seq_len = QWEN3_MAX_SEQ_LEN;
+        return (float *)calloc(QWEN3_MAX_SEQ_LEN * QWEN3_TEXT_DIM, sizeof(float));
     }
 
-    /* Encode to embeddings */
-    float *embeddings = text_encoder_forward(ctx->text_encoder, tokens, num_tokens);
+    /* Use Qwen3 encoder (handles tokenization internally) */
+    float *embeddings = qwen3_encode_text(ctx->qwen3_encoder, prompt);
 
-    free(tokens);
-
-    *out_seq_len = num_tokens;
+    *out_seq_len = QWEN3_MAX_SEQ_LEN;  /* Always 512 */
     return embeddings;
 }
 
@@ -374,7 +292,7 @@ flux_image *flux_generate(flux_ctx *ctx, const char *prompt,
 
     /* Sample */
     float *latent = flux_sample_euler(
-        ctx->transformer, ctx->text_encoder,
+        ctx->transformer, ctx->qwen3_encoder,
         z, 1, FLUX_LATENT_CHANNELS, latent_h, latent_w,
         text_emb, text_seq,
         NULL,  /* No null embedding for klein */
@@ -485,7 +403,7 @@ flux_image *flux_generate_with_embeddings(flux_ctx *ctx,
 
     /* Sample */
     float *latent = flux_sample_euler(
-        ctx->transformer, ctx->text_encoder,
+        ctx->transformer, ctx->qwen3_encoder,
         z, 1, FLUX_LATENT_CHANNELS, latent_h, latent_w,
         text_emb, text_seq,
         NULL,
@@ -580,7 +498,7 @@ flux_image *flux_generate_with_embeddings_and_noise(flux_ctx *ctx,
 
     /* Sample */
     float *latent = flux_sample_euler(
-        ctx->transformer, ctx->text_encoder,
+        ctx->transformer, ctx->qwen3_encoder,
         z, 1, FLUX_LATENT_CHANNELS, latent_h, latent_w,
         text_emb, text_seq,
         NULL,
@@ -709,7 +627,7 @@ flux_image *flux_img2img(flux_ctx *ctx, const char *prompt,
 
     /* Sample */
     float *latent = flux_sample_euler(
-        ctx->transformer, ctx->text_encoder,
+        ctx->transformer, ctx->qwen3_encoder,
         img_latent, 1, FLUX_LATENT_CHANNELS, latent_h, latent_w,
         text_emb, text_seq, NULL,
         schedule, num_steps,

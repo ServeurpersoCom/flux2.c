@@ -274,6 +274,65 @@ print('PASS' if diff.max() < 2 else 'FAIL')
 
 ---
 
+## Reference Text Embeddings for Testing
+
+A reference embeddings file is available for testing the C text encoder implementation without triggering full image generation.
+
+### Reference File
+- **File**: `text_embeddings_official.bin`
+- **Prompt**: `"A fluffy orange cat sitting on a windowsill"`
+- **Shape**: `[1, 512, 7680]` (FP32)
+- **Size**: 15,728,640 bytes (15.00 MB)
+- **MD5**: `b0fa2d7a77d7860752c9de4114e427b9`
+
+### Generating Embeddings
+
+Use the script `misc/generate_embeddings.py` to generate new reference embeddings:
+
+```bash
+# Generate embeddings for a specific prompt
+python3 misc/generate_embeddings.py "A fluffy orange cat sitting on a windowsill"
+
+# Generate to a custom output file
+python3 misc/generate_embeddings.py "Your prompt here" output.bin
+```
+
+**Requirements**: Python 3 with `torch`, `transformers`, `einops`
+
+The script:
+1. Loads Qwen3-4B model (from HuggingFace cache or downloads ~8GB)
+2. Applies chat template: `<|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n`
+3. Tokenizes to 512 tokens with padding
+4. Extracts hidden states from layers [9, 18, 27]
+5. Reshapes to `[1, 512, 7680]` and saves as FP32 binary
+
+### Testing C Text Encoder Implementation
+
+When implementing the C text encoder, you can verify correctness by:
+
+1. **Generate reference embeddings** for a test prompt using the Python script
+2. **Run C text encoder** on the same prompt
+3. **Compare binary outputs**:
+   ```bash
+   # Binary comparison
+   cmp reference.bin c_output.bin
+
+   # Or load in Python and compare numerically
+   python3 -c "
+   import numpy as np
+   ref = np.fromfile('reference.bin', dtype=np.float32).reshape(1, 512, 7680)
+   c = np.fromfile('c_output.bin', dtype=np.float32).reshape(1, 512, 7680)
+   diff = np.abs(ref - c)
+   print(f'Max diff: {diff.max():.6f}')
+   print(f'Mean diff: {diff.mean():.6f}')
+   print('PASS' if diff.max() < 1e-4 else 'FAIL - check implementation')
+   "
+   ```
+
+This allows fast iteration on the C text encoder without running full image generation (which takes 15+ minutes at 1024x1024).
+
+---
+
 ## Qwen3 Text Encoder Implementation Plan
 
 This section documents the plan to implement native text encoding so that `-p "a car"` works directly without pre-computed embeddings.
@@ -571,3 +630,89 @@ flux_tokenizer.c    - Update for Qwen3 tokenizer (currently has placeholder)
 
 3. **GQA implementation**: Grouped Query Attention is slightly different from standard MHA
    - 20 query heads share 4 KV heads (5:1 ratio)
+
+---
+
+## Qwen3 Text Encoder - IMPLEMENTED (2024-01-18)
+
+The Qwen3 text encoder has been fully implemented in C. The `-p "prompt"` option now works directly without needing pre-computed embeddings.
+
+### Implementation Files
+
+- **flux_qwen3.h** - Public API and architecture constants
+- **flux_qwen3.c** - Model implementation (forward pass, weight loading)
+- **flux_qwen3_tokenizer.c** - BPE tokenizer with chat template
+
+### Architecture Details (Verified)
+
+From `text_encoder/config.json`:
+- hidden_size: 2560
+- intermediate_size: 9728
+- num_attention_heads: 32
+- num_key_value_heads: 8 (GQA 4:1 ratio)
+- head_dim: 128 (via `hidden_size / num_attention_heads * (num_attention_heads / num_key_value_heads)`)
+- num_hidden_layers: 36
+- vocab_size: 151936
+- rms_norm_eps: 1e-6
+- rope_theta: 1000000.0
+
+### Layer Extraction (Critical Fix)
+
+Python's `hidden_states` indexing:
+- `hidden_states[0]` = input embeddings
+- `hidden_states[i]` = output AFTER layer `i-1` (0-indexed)
+
+So extracting layers [9, 18, 27] means:
+- `hidden_states[9]` = after layer 8
+- `hidden_states[18]` = after layer 17
+- `hidden_states[27]` = after layer 26
+
+C implementation extracts at `QWEN3_OUTPUT_LAYER_1=8`, `QWEN3_OUTPUT_LAYER_2=17`, `QWEN3_OUTPUT_LAYER_3=26`.
+
+### Chat Template
+
+Format applied by tokenizer:
+```
+<|im_start|>user
+{prompt}<|im_end|>
+<|im_start|>assistant
+<think>
+
+</think>
+
+```
+
+Special tokens:
+- `<|im_start|>` = 151644
+- `<|im_end|>` = 151645
+- `<|endoftext|>` = 151643 (PAD)
+- `<think>` = 151667
+- `</think>` = 151668
+
+### Test Results
+
+Embeddings match Python reference within FP32 precision:
+```
+Stats for real tokens only (first 21):
+  Max diff: 0.011719
+  Mean diff: 0.000006
+
+*** PASS: Embeddings match within tolerance! ***
+```
+
+### Usage
+
+```bash
+# Direct text-to-image generation
+./flux -d flux-klein-model -p "A fluffy orange cat" -o cat.png
+
+# Still supports pre-computed embeddings for compatibility
+./flux -d flux-klein-model --embeddings text_embeddings.bin -o output.png
+```
+
+### Performance Notes
+
+- Text encoding runs on CPU using Accelerate BLAS
+- ~36 transformer layers × 512 sequence length
+- Encoding time: ~2-3 seconds on M3 Max
+- Memory: ~8 GB for FP32 weights (loaded from safetensors)

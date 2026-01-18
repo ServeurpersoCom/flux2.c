@@ -1,0 +1,731 @@
+/*
+ * Qwen3 Text Encoder Implementation
+ *
+ * Implements Qwen3-4B model for text encoding in FLUX image generation.
+ * - 36 transformer layers
+ * - 2560 hidden dimension
+ * - GQA with 32 query heads and 8 KV heads
+ * - RoPE positional embeddings
+ * - SwiGLU MLP
+ */
+
+#include "flux_qwen3.h"
+#include "flux_safetensors.h"
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <math.h>
+
+#ifdef __APPLE__
+#include <Accelerate/Accelerate.h>
+#define USE_BLAS 1
+#else
+#ifdef USE_OPENBLAS
+#include <cblas.h>
+#define USE_BLAS 1
+#endif
+#endif
+
+/* ========================================================================
+ * Data Structures
+ * ======================================================================== */
+
+typedef struct {
+    float *q_proj_weight;     /* [num_heads * head_dim, hidden] = [4096, 2560] */
+    float *k_proj_weight;     /* [num_kv_heads * head_dim, hidden] = [1024, 2560] */
+    float *v_proj_weight;     /* [num_kv_heads * head_dim, hidden] = [1024, 2560] */
+    float *o_proj_weight;     /* [hidden, num_heads * head_dim] = [2560, 4096] */
+    float *q_norm_weight;     /* [head_dim] = [128] */
+    float *k_norm_weight;     /* [head_dim] = [128] */
+} qwen3_attention_t;
+
+typedef struct {
+    float *gate_proj_weight;  /* [intermediate, hidden] = [9728, 2560] */
+    float *up_proj_weight;    /* [intermediate, hidden] = [9728, 2560] */
+    float *down_proj_weight;  /* [hidden, intermediate] = [2560, 9728] */
+} qwen3_mlp_t;
+
+typedef struct {
+    float *input_layernorm_weight;      /* [hidden] */
+    float *post_attention_layernorm_weight;  /* [hidden] */
+    qwen3_attention_t attn;
+    qwen3_mlp_t mlp;
+} qwen3_layer_t;
+
+struct qwen3_model {
+    /* Embedding layer */
+    float *embed_tokens;      /* [vocab_size, hidden] = [151936, 2560] */
+
+    /* Transformer layers */
+    qwen3_layer_t *layers;    /* [num_layers] */
+    int num_layers;
+
+    /* Final layer norm */
+    float *norm_weight;       /* [hidden] */
+
+    /* RoPE precomputed */
+    float *rope_cos;          /* [max_seq_len, head_dim/2] */
+    float *rope_sin;          /* [max_seq_len, head_dim/2] */
+
+    /* Working memory */
+    float *hidden_state;      /* [seq_len, hidden] */
+    float *residual;          /* [seq_len, hidden] */
+    float *q_buf;             /* [seq_len, num_heads * head_dim] */
+    float *k_buf;             /* [seq_len, num_kv_heads * head_dim] */
+    float *v_buf;             /* [seq_len, num_kv_heads * head_dim] */
+    float *attn_scores;       /* [num_heads, seq_len, seq_len] */
+    float *attn_out;          /* [seq_len, num_heads * head_dim] */
+    float *mlp_gate;          /* [seq_len, intermediate] */
+    float *mlp_up;            /* [seq_len, intermediate] */
+    float *mlp_out;           /* [seq_len, hidden] */
+    float *norm_buf;          /* [seq_len, hidden] */
+
+    /* Output layers storage (for extracting layers 9, 18, 27) */
+    float *layer_outputs[3];  /* [seq_len, hidden] each */
+};
+
+/* ========================================================================
+ * Basic Operations
+ * ======================================================================== */
+
+static void qwen3_linear(float *y, const float *x, const float *W,
+                         int seq_len, int in_dim, int out_dim) {
+    /* y[seq, out] = x[seq, in] @ W[out, in]^T */
+#ifdef USE_BLAS
+    cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
+                seq_len, out_dim, in_dim,
+                1.0f, x, in_dim, W, in_dim,
+                0.0f, y, out_dim);
+#else
+    for (int s = 0; s < seq_len; s++) {
+        for (int o = 0; o < out_dim; o++) {
+            float sum = 0.0f;
+            for (int i = 0; i < in_dim; i++) {
+                sum += x[s * in_dim + i] * W[o * in_dim + i];
+            }
+            y[s * out_dim + o] = sum;
+        }
+    }
+#endif
+}
+
+static void qwen3_rms_norm(float *out, const float *x, const float *weight,
+                           int seq_len, int hidden, float eps) {
+    for (int s = 0; s < seq_len; s++) {
+        const float *x_row = x + s * hidden;
+        float *out_row = out + s * hidden;
+
+        /* Compute RMS */
+        float sum_sq = 0.0f;
+        for (int i = 0; i < hidden; i++) {
+            sum_sq += x_row[i] * x_row[i];
+        }
+        float rms = sqrtf(sum_sq / hidden + eps);
+        float rms_inv = 1.0f / rms;
+
+        /* Normalize and scale */
+        for (int i = 0; i < hidden; i++) {
+            out_row[i] = x_row[i] * rms_inv * weight[i];
+        }
+    }
+}
+
+/* Per-head RMS norm for Q/K normalization */
+static void qwen3_head_rms_norm(float *out, const float *x, const float *weight,
+                                int seq_len, int num_heads, int head_dim, float eps) {
+    for (int s = 0; s < seq_len; s++) {
+        for (int h = 0; h < num_heads; h++) {
+            const float *x_head = x + s * num_heads * head_dim + h * head_dim;
+            float *out_head = out + s * num_heads * head_dim + h * head_dim;
+
+            /* Compute RMS for this head */
+            float sum_sq = 0.0f;
+            for (int i = 0; i < head_dim; i++) {
+                sum_sq += x_head[i] * x_head[i];
+            }
+            float rms = sqrtf(sum_sq / head_dim + eps);
+            float rms_inv = 1.0f / rms;
+
+            /* Normalize and scale */
+            for (int i = 0; i < head_dim; i++) {
+                out_head[i] = x_head[i] * rms_inv * weight[i];
+            }
+        }
+    }
+}
+
+static void qwen3_silu(float *x, int n) {
+    for (int i = 0; i < n; i++) {
+        x[i] = x[i] / (1.0f + expf(-x[i]));
+    }
+}
+
+static void qwen3_softmax(float *x, int len) {
+    float max_val = x[0];
+    for (int i = 1; i < len; i++) {
+        if (x[i] > max_val) max_val = x[i];
+    }
+
+    float sum = 0.0f;
+    for (int i = 0; i < len; i++) {
+        x[i] = expf(x[i] - max_val);
+        sum += x[i];
+    }
+
+    float inv_sum = 1.0f / sum;
+    for (int i = 0; i < len; i++) {
+        x[i] *= inv_sum;
+    }
+}
+
+/* ========================================================================
+ * RoPE (Rotary Position Embedding)
+ * ======================================================================== */
+
+static void compute_rope_freqs(float *cos_out, float *sin_out,
+                               int max_seq_len, int head_dim, float theta) {
+    int half_dim = head_dim / 2;
+
+    for (int pos = 0; pos < max_seq_len; pos++) {
+        for (int i = 0; i < half_dim; i++) {
+            float freq = 1.0f / powf(theta, (float)(2 * i) / head_dim);
+            float angle = pos * freq;
+            cos_out[pos * half_dim + i] = cosf(angle);
+            sin_out[pos * half_dim + i] = sinf(angle);
+        }
+    }
+}
+
+static void apply_rope(float *q, float *k, const float *cos_cache, const float *sin_cache,
+                       int seq_len, int num_q_heads, int num_kv_heads, int head_dim) {
+    int half_dim = head_dim / 2;
+
+    /* Apply RoPE to Q */
+    for (int s = 0; s < seq_len; s++) {
+        const float *cos_row = cos_cache + s * half_dim;
+        const float *sin_row = sin_cache + s * half_dim;
+
+        for (int h = 0; h < num_q_heads; h++) {
+            float *q_head = q + s * num_q_heads * head_dim + h * head_dim;
+
+            for (int i = 0; i < half_dim; i++) {
+                float x0 = q_head[i];
+                float x1 = q_head[i + half_dim];
+                float cos_val = cos_row[i];
+                float sin_val = sin_row[i];
+
+                q_head[i] = x0 * cos_val - x1 * sin_val;
+                q_head[i + half_dim] = x0 * sin_val + x1 * cos_val;
+            }
+        }
+    }
+
+    /* Apply RoPE to K */
+    for (int s = 0; s < seq_len; s++) {
+        const float *cos_row = cos_cache + s * half_dim;
+        const float *sin_row = sin_cache + s * half_dim;
+
+        for (int h = 0; h < num_kv_heads; h++) {
+            float *k_head = k + s * num_kv_heads * head_dim + h * head_dim;
+
+            for (int i = 0; i < half_dim; i++) {
+                float x0 = k_head[i];
+                float x1 = k_head[i + half_dim];
+                float cos_val = cos_row[i];
+                float sin_val = sin_row[i];
+
+                k_head[i] = x0 * cos_val - x1 * sin_val;
+                k_head[i + half_dim] = x0 * sin_val + x1 * cos_val;
+            }
+        }
+    }
+}
+
+/* ========================================================================
+ * Attention
+ * ======================================================================== */
+
+static void qwen3_attention_forward(qwen3_model_t *model, qwen3_layer_t *layer,
+                                    int seq_len, const int *attention_mask) {
+    int num_heads = QWEN3_NUM_HEADS;
+    int num_kv_heads = QWEN3_NUM_KV_HEADS;
+    int head_dim = QWEN3_HEAD_DIM;
+    int hidden = QWEN3_HIDDEN_SIZE;
+    int kv_dim = num_kv_heads * head_dim;
+    int q_dim = num_heads * head_dim;
+    float scale = 1.0f / sqrtf((float)head_dim);
+
+    /* Q, K, V projections */
+    qwen3_linear(model->q_buf, model->norm_buf, layer->attn.q_proj_weight,
+                 seq_len, hidden, q_dim);
+    qwen3_linear(model->k_buf, model->norm_buf, layer->attn.k_proj_weight,
+                 seq_len, hidden, kv_dim);
+    qwen3_linear(model->v_buf, model->norm_buf, layer->attn.v_proj_weight,
+                 seq_len, hidden, kv_dim);
+
+    /* Q/K RMS normalization (per-head) */
+    qwen3_head_rms_norm(model->q_buf, model->q_buf, layer->attn.q_norm_weight,
+                        seq_len, num_heads, head_dim, QWEN3_RMS_NORM_EPS);
+    qwen3_head_rms_norm(model->k_buf, model->k_buf, layer->attn.k_norm_weight,
+                        seq_len, num_kv_heads, head_dim, QWEN3_RMS_NORM_EPS);
+
+    /* Apply RoPE */
+    apply_rope(model->q_buf, model->k_buf, model->rope_cos, model->rope_sin,
+               seq_len, num_heads, num_kv_heads, head_dim);
+
+    /* Compute attention for each head with GQA */
+    int heads_per_kv = num_heads / num_kv_heads;
+
+    for (int h = 0; h < num_heads; h++) {
+        int kv_h = h / heads_per_kv;  /* Which KV head to use */
+
+        /* Get pointers for this head */
+        float *scores = model->attn_scores + h * seq_len * seq_len;
+
+        /* Compute Q @ K^T for this head */
+        for (int i = 0; i < seq_len; i++) {
+            const float *q_row = model->q_buf + i * q_dim + h * head_dim;
+            for (int j = 0; j < seq_len; j++) {
+                const float *k_row = model->k_buf + j * kv_dim + kv_h * head_dim;
+
+                float dot = 0.0f;
+                for (int d = 0; d < head_dim; d++) {
+                    dot += q_row[d] * k_row[d];
+                }
+                scores[i * seq_len + j] = dot * scale;
+            }
+        }
+
+        /* Apply causal mask and attention mask */
+        for (int i = 0; i < seq_len; i++) {
+            for (int j = 0; j < seq_len; j++) {
+                if (j > i) {
+                    /* Causal mask: can't attend to future */
+                    scores[i * seq_len + j] = -1e9f;
+                }
+                if (attention_mask && attention_mask[j] == 0) {
+                    /* Padding mask */
+                    scores[i * seq_len + j] = -1e9f;
+                }
+            }
+            qwen3_softmax(scores + i * seq_len, seq_len);
+        }
+
+        /* Compute attention output: scores @ V */
+        for (int i = 0; i < seq_len; i++) {
+            float *out_row = model->attn_out + i * q_dim + h * head_dim;
+            memset(out_row, 0, head_dim * sizeof(float));
+
+            for (int j = 0; j < seq_len; j++) {
+                float score = scores[i * seq_len + j];
+                const float *v_row = model->v_buf + j * kv_dim + kv_h * head_dim;
+
+                for (int d = 0; d < head_dim; d++) {
+                    out_row[d] += score * v_row[d];
+                }
+            }
+        }
+    }
+
+    /* Output projection */
+    qwen3_linear(model->hidden_state, model->attn_out, layer->attn.o_proj_weight,
+                 seq_len, q_dim, hidden);
+}
+
+/* ========================================================================
+ * MLP (SwiGLU)
+ * ======================================================================== */
+
+static void qwen3_mlp_forward(qwen3_model_t *model, qwen3_layer_t *layer, int seq_len) {
+    int hidden = QWEN3_HIDDEN_SIZE;
+    int intermediate = QWEN3_INTERMEDIATE_SIZE;
+
+    /* Gate and Up projections */
+    qwen3_linear(model->mlp_gate, model->norm_buf, layer->mlp.gate_proj_weight,
+                 seq_len, hidden, intermediate);
+    qwen3_linear(model->mlp_up, model->norm_buf, layer->mlp.up_proj_weight,
+                 seq_len, hidden, intermediate);
+
+    /* SwiGLU: silu(gate) * up */
+    int n = seq_len * intermediate;
+    qwen3_silu(model->mlp_gate, n);
+    for (int i = 0; i < n; i++) {
+        model->mlp_gate[i] *= model->mlp_up[i];
+    }
+
+    /* Down projection */
+    qwen3_linear(model->mlp_out, model->mlp_gate, layer->mlp.down_proj_weight,
+                 seq_len, intermediate, hidden);
+}
+
+/* ========================================================================
+ * Transformer Layer
+ * ======================================================================== */
+
+static void qwen3_layer_forward(qwen3_model_t *model, qwen3_layer_t *layer,
+                                int seq_len, const int *attention_mask) {
+    int hidden = QWEN3_HIDDEN_SIZE;
+
+    /* Save residual */
+    memcpy(model->residual, model->hidden_state, seq_len * hidden * sizeof(float));
+
+    /* Pre-attention LayerNorm */
+    qwen3_rms_norm(model->norm_buf, model->hidden_state, layer->input_layernorm_weight,
+                   seq_len, hidden, QWEN3_RMS_NORM_EPS);
+
+    /* Self-attention */
+    qwen3_attention_forward(model, layer, seq_len, attention_mask);
+
+    /* Residual connection */
+    for (int i = 0; i < seq_len * hidden; i++) {
+        model->hidden_state[i] += model->residual[i];
+    }
+
+    /* Save residual */
+    memcpy(model->residual, model->hidden_state, seq_len * hidden * sizeof(float));
+
+    /* Pre-MLP LayerNorm */
+    qwen3_rms_norm(model->norm_buf, model->hidden_state, layer->post_attention_layernorm_weight,
+                   seq_len, hidden, QWEN3_RMS_NORM_EPS);
+
+    /* MLP */
+    qwen3_mlp_forward(model, layer, seq_len);
+
+    /* Residual connection */
+    for (int i = 0; i < seq_len * hidden; i++) {
+        model->hidden_state[i] = model->residual[i] + model->mlp_out[i];
+    }
+}
+
+/* ========================================================================
+ * Forward Pass
+ * ======================================================================== */
+
+float *qwen3_forward(qwen3_model_t *model, const int *input_ids,
+                     const int *attention_mask, int seq_len) {
+    int hidden = QWEN3_HIDDEN_SIZE;
+
+    /* Embedding lookup */
+    for (int s = 0; s < seq_len; s++) {
+        int token_id = input_ids[s];
+        if (token_id >= 0 && token_id < QWEN3_VOCAB_SIZE) {
+            memcpy(model->hidden_state + s * hidden,
+                   model->embed_tokens + token_id * hidden,
+                   hidden * sizeof(float));
+        } else {
+            /* Unknown token - use zeros */
+            memset(model->hidden_state + s * hidden, 0, hidden * sizeof(float));
+        }
+    }
+
+    /* Run through transformer layers */
+    for (int layer_idx = 0; layer_idx < model->num_layers; layer_idx++) {
+        qwen3_layer_forward(model, &model->layers[layer_idx], seq_len, attention_mask);
+
+        /* Save output at extraction layers (9, 18, 27) */
+        if (layer_idx == QWEN3_OUTPUT_LAYER_1) {
+            memcpy(model->layer_outputs[0], model->hidden_state, seq_len * hidden * sizeof(float));
+        } else if (layer_idx == QWEN3_OUTPUT_LAYER_2) {
+            memcpy(model->layer_outputs[1], model->hidden_state, seq_len * hidden * sizeof(float));
+        } else if (layer_idx == QWEN3_OUTPUT_LAYER_3) {
+            memcpy(model->layer_outputs[2], model->hidden_state, seq_len * hidden * sizeof(float));
+        }
+
+        /* Progress indicator */
+        if ((layer_idx + 1) % 6 == 0) {
+            fprintf(stderr, ".");
+            fflush(stderr);
+        }
+    }
+    fprintf(stderr, "\n");
+
+    /* Concatenate outputs from layers 9, 18, 27 -> [seq_len, 7680] */
+    float *output = malloc(seq_len * QWEN3_TEXT_DIM * sizeof(float));
+    if (!output) return NULL;
+
+    for (int s = 0; s < seq_len; s++) {
+        /* Copy layer 9 output */
+        memcpy(output + s * QWEN3_TEXT_DIM,
+               model->layer_outputs[0] + s * hidden,
+               hidden * sizeof(float));
+        /* Copy layer 18 output */
+        memcpy(output + s * QWEN3_TEXT_DIM + hidden,
+               model->layer_outputs[1] + s * hidden,
+               hidden * sizeof(float));
+        /* Copy layer 27 output */
+        memcpy(output + s * QWEN3_TEXT_DIM + 2 * hidden,
+               model->layer_outputs[2] + s * hidden,
+               hidden * sizeof(float));
+    }
+
+    return output;
+}
+
+/* ========================================================================
+ * Model Loading
+ * ======================================================================== */
+
+/* Helper to load a tensor from safetensors files */
+static float *load_tensor(safetensors_file_t **files, int num_files, const char *name) {
+    for (int f = 0; f < num_files; f++) {
+        const safetensor_t *t = safetensors_find(files[f], name);
+        if (t) {
+            return safetensors_get_f32(files[f], t);
+        }
+    }
+    fprintf(stderr, "Warning: tensor not found: %s\n", name);
+    return NULL;
+}
+
+static int load_layer_weights(qwen3_layer_t *layer, safetensors_file_t **files,
+                              int num_files, int layer_idx) {
+    char name[256];
+
+    /* Input layernorm */
+    snprintf(name, sizeof(name), "model.layers.%d.input_layernorm.weight", layer_idx);
+    layer->input_layernorm_weight = load_tensor(files, num_files, name);
+
+    /* Post-attention layernorm */
+    snprintf(name, sizeof(name), "model.layers.%d.post_attention_layernorm.weight", layer_idx);
+    layer->post_attention_layernorm_weight = load_tensor(files, num_files, name);
+
+    /* Attention weights */
+    snprintf(name, sizeof(name), "model.layers.%d.self_attn.q_proj.weight", layer_idx);
+    layer->attn.q_proj_weight = load_tensor(files, num_files, name);
+
+    snprintf(name, sizeof(name), "model.layers.%d.self_attn.k_proj.weight", layer_idx);
+    layer->attn.k_proj_weight = load_tensor(files, num_files, name);
+
+    snprintf(name, sizeof(name), "model.layers.%d.self_attn.v_proj.weight", layer_idx);
+    layer->attn.v_proj_weight = load_tensor(files, num_files, name);
+
+    snprintf(name, sizeof(name), "model.layers.%d.self_attn.o_proj.weight", layer_idx);
+    layer->attn.o_proj_weight = load_tensor(files, num_files, name);
+
+    /* Q/K norm */
+    snprintf(name, sizeof(name), "model.layers.%d.self_attn.q_norm.weight", layer_idx);
+    layer->attn.q_norm_weight = load_tensor(files, num_files, name);
+
+    snprintf(name, sizeof(name), "model.layers.%d.self_attn.k_norm.weight", layer_idx);
+    layer->attn.k_norm_weight = load_tensor(files, num_files, name);
+
+    /* MLP weights */
+    snprintf(name, sizeof(name), "model.layers.%d.mlp.gate_proj.weight", layer_idx);
+    layer->mlp.gate_proj_weight = load_tensor(files, num_files, name);
+
+    snprintf(name, sizeof(name), "model.layers.%d.mlp.up_proj.weight", layer_idx);
+    layer->mlp.up_proj_weight = load_tensor(files, num_files, name);
+
+    snprintf(name, sizeof(name), "model.layers.%d.mlp.down_proj.weight", layer_idx);
+    layer->mlp.down_proj_weight = load_tensor(files, num_files, name);
+
+    return 0;
+}
+
+qwen3_model_t *qwen3_model_load(const char *model_dir) {
+    qwen3_model_t *model = calloc(1, sizeof(qwen3_model_t));
+    if (!model) return NULL;
+
+    model->num_layers = QWEN3_NUM_LAYERS;
+    model->layers = calloc(model->num_layers, sizeof(qwen3_layer_t));
+    if (!model->layers) {
+        free(model);
+        return NULL;
+    }
+
+    /* Open safetensors files */
+    char path1[512], path2[512];
+    snprintf(path1, sizeof(path1), "%s/model-00001-of-00002.safetensors", model_dir);
+    snprintf(path2, sizeof(path2), "%s/model-00002-of-00002.safetensors", model_dir);
+
+    safetensors_file_t *files[2];
+    files[0] = safetensors_open(path1);
+    files[1] = safetensors_open(path2);
+
+    if (!files[0] || !files[1]) {
+        fprintf(stderr, "qwen3_model_load: failed to open safetensors files\n");
+        if (files[0]) safetensors_close(files[0]);
+        if (files[1]) safetensors_close(files[1]);
+        free(model->layers);
+        free(model);
+        return NULL;
+    }
+
+    fprintf(stderr, "Loading Qwen3 model...\n");
+
+    /* Load embedding weights */
+    int hidden = QWEN3_HIDDEN_SIZE;
+    model->embed_tokens = load_tensor(files, 2, "model.embed_tokens.weight");
+    if (!model->embed_tokens) {
+        fprintf(stderr, "qwen3_model_load: failed to load embed_tokens\n");
+        goto error;
+    }
+    fprintf(stderr, "  Loaded embeddings\n");
+
+    /* Load layer weights */
+    for (int i = 0; i < model->num_layers; i++) {
+        load_layer_weights(&model->layers[i], files, 2, i);
+        if ((i + 1) % 6 == 0) {
+            fprintf(stderr, "  Loaded layer %d/%d\n", i + 1, model->num_layers);
+        }
+    }
+
+    /* Load final norm */
+    model->norm_weight = load_tensor(files, 2, "model.norm.weight");
+    fprintf(stderr, "  Loaded final norm\n");
+
+    safetensors_close(files[0]);
+    safetensors_close(files[1]);
+
+    /* Compute RoPE frequencies */
+    int max_seq = QWEN3_MAX_SEQ_LEN;
+    int half_dim = QWEN3_HEAD_DIM / 2;
+    model->rope_cos = malloc(max_seq * half_dim * sizeof(float));
+    model->rope_sin = malloc(max_seq * half_dim * sizeof(float));
+    compute_rope_freqs(model->rope_cos, model->rope_sin, max_seq,
+                       QWEN3_HEAD_DIM, QWEN3_ROPE_THETA);
+
+    /* Allocate working memory */
+    int seq_len = QWEN3_MAX_SEQ_LEN;
+    int num_heads = QWEN3_NUM_HEADS;
+    int num_kv_heads = QWEN3_NUM_KV_HEADS;
+    int head_dim = QWEN3_HEAD_DIM;
+    int intermediate = QWEN3_INTERMEDIATE_SIZE;
+
+    model->hidden_state = malloc(seq_len * hidden * sizeof(float));
+    model->residual = malloc(seq_len * hidden * sizeof(float));
+    model->q_buf = malloc(seq_len * num_heads * head_dim * sizeof(float));
+    model->k_buf = malloc(seq_len * num_kv_heads * head_dim * sizeof(float));
+    model->v_buf = malloc(seq_len * num_kv_heads * head_dim * sizeof(float));
+    model->attn_scores = malloc(num_heads * seq_len * seq_len * sizeof(float));
+    model->attn_out = malloc(seq_len * num_heads * head_dim * sizeof(float));
+    model->mlp_gate = malloc(seq_len * intermediate * sizeof(float));
+    model->mlp_up = malloc(seq_len * intermediate * sizeof(float));
+    model->mlp_out = malloc(seq_len * hidden * sizeof(float));
+    model->norm_buf = malloc(seq_len * hidden * sizeof(float));
+
+    for (int i = 0; i < 3; i++) {
+        model->layer_outputs[i] = malloc(seq_len * hidden * sizeof(float));
+    }
+
+    fprintf(stderr, "Qwen3 model loaded successfully\n");
+    return model;
+
+error:
+    safetensors_close(files[0]);
+    safetensors_close(files[1]);
+    qwen3_model_free(model);
+    return NULL;
+}
+
+void qwen3_model_free(qwen3_model_t *model) {
+    if (!model) return;
+
+    free(model->embed_tokens);
+    free(model->norm_weight);
+    free(model->rope_cos);
+    free(model->rope_sin);
+
+    if (model->layers) {
+        for (int i = 0; i < model->num_layers; i++) {
+            qwen3_layer_t *layer = &model->layers[i];
+            free(layer->input_layernorm_weight);
+            free(layer->post_attention_layernorm_weight);
+            free(layer->attn.q_proj_weight);
+            free(layer->attn.k_proj_weight);
+            free(layer->attn.v_proj_weight);
+            free(layer->attn.o_proj_weight);
+            free(layer->attn.q_norm_weight);
+            free(layer->attn.k_norm_weight);
+            free(layer->mlp.gate_proj_weight);
+            free(layer->mlp.up_proj_weight);
+            free(layer->mlp.down_proj_weight);
+        }
+        free(model->layers);
+    }
+
+    free(model->hidden_state);
+    free(model->residual);
+    free(model->q_buf);
+    free(model->k_buf);
+    free(model->v_buf);
+    free(model->attn_scores);
+    free(model->attn_out);
+    free(model->mlp_gate);
+    free(model->mlp_up);
+    free(model->mlp_out);
+    free(model->norm_buf);
+
+    for (int i = 0; i < 3; i++) {
+        free(model->layer_outputs[i]);
+    }
+
+    free(model);
+}
+
+/* ========================================================================
+ * Combined Encoder API
+ * ======================================================================== */
+
+qwen3_encoder_t *qwen3_encoder_load(const char *model_dir) {
+    qwen3_encoder_t *enc = calloc(1, sizeof(qwen3_encoder_t));
+    if (!enc) return NULL;
+
+    /* Load tokenizer */
+    char tok_path[512];
+    snprintf(tok_path, sizeof(tok_path), "%s/tokenizer/tokenizer.json", model_dir);
+    enc->tokenizer = qwen3_tokenizer_load(tok_path);
+    if (!enc->tokenizer) {
+        fprintf(stderr, "qwen3_encoder_load: failed to load tokenizer\n");
+        free(enc);
+        return NULL;
+    }
+
+    /* Load model */
+    char model_path[512];
+    snprintf(model_path, sizeof(model_path), "%s/text_encoder", model_dir);
+    enc->model = qwen3_model_load(model_path);
+    if (!enc->model) {
+        fprintf(stderr, "qwen3_encoder_load: failed to load model\n");
+        qwen3_tokenizer_free(enc->tokenizer);
+        free(enc);
+        return NULL;
+    }
+
+    return enc;
+}
+
+void qwen3_encoder_free(qwen3_encoder_t *enc) {
+    if (!enc) return;
+    qwen3_tokenizer_free(enc->tokenizer);
+    qwen3_model_free(enc->model);
+    free(enc);
+}
+
+float *qwen3_encode_text(qwen3_encoder_t *enc, const char *prompt) {
+    if (!enc || !enc->tokenizer || !enc->model || !prompt) return NULL;
+
+    /* Tokenize with chat template */
+    int num_tokens;
+    int *tokens = qwen3_tokenize_chat(enc->tokenizer, prompt, &num_tokens, QWEN3_MAX_SEQ_LEN);
+    if (!tokens) return NULL;
+
+    /* Pad to max length */
+    int *attention_mask = malloc(QWEN3_MAX_SEQ_LEN * sizeof(int));
+    int *padded_tokens = qwen3_pad_tokens(tokens, num_tokens, QWEN3_MAX_SEQ_LEN, attention_mask);
+    free(tokens);
+
+    if (!padded_tokens) {
+        free(attention_mask);
+        return NULL;
+    }
+
+    /* Forward pass */
+    fprintf(stderr, "Running text encoder");
+    float *embeddings = qwen3_forward(enc->model, padded_tokens, attention_mask, QWEN3_MAX_SEQ_LEN);
+
+    free(padded_tokens);
+    free(attention_mask);
+
+    return embeddings;
+}
