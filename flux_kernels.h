@@ -279,14 +279,33 @@ void flux_transpose(float *out, const float *in, int M, int N);
 /* ... handled at higher level ... */
 
 /* ========================================================================
- * Progress Callback
+ * Progress Callbacks
  * ======================================================================== */
 
-/* Substep progress callback - called during transformer forward pass
- * to report fine-grained progress within a sampling step.
- * The callback receives a single character to print (e.g., '.' or 'd').
+/* Substep types during transformer forward pass */
+typedef enum {
+    FLUX_SUBSTEP_DOUBLE_BLOCK,   /* Double-stream block completed */
+    FLUX_SUBSTEP_SINGLE_BLOCK,   /* Single-stream block completed */
+    FLUX_SUBSTEP_FINAL_LAYER,    /* Final layer completed */
+} flux_substep_type_t;
+
+/*
+ * Substep callback - called during transformer forward pass.
+ * type: which operation completed
+ * index: 0-based index of this substep within its type
+ * total: total count for this substep type
  */
-typedef void (*flux_substep_callback_t)(char c);
+typedef void (*flux_substep_callback_t)(flux_substep_type_t type, int index, int total);
+
+/*
+ * Step callback - called at sampling step boundaries.
+ * step: current step (1-based), or 0 to indicate sampling is starting
+ * total: total number of steps
+ */
+typedef void (*flux_step_callback_t)(int step, int total);
+
+/* Global callback pointers - set by caller before inference */
 extern flux_substep_callback_t flux_substep_callback;
+extern flux_step_callback_t flux_step_callback;
 
 #endif /* FLUX_KERNELS_H */

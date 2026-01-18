@@ -1170,7 +1170,8 @@ float *flux_transformer_forward(flux_transformer_t *tf,
                              img_rope_cos, img_rope_sin,
                              txt_rope_cos, txt_rope_sin,
                              img_seq, txt_seq, tf);
-        if (flux_substep_callback) flux_substep_callback('d');
+        if (flux_substep_callback)
+            flux_substep_callback(FLUX_SUBSTEP_DOUBLE_BLOCK, i, tf->num_double_layers);
 #ifdef DEBUG_TRANSFORMER
         if (i == 0) {
             fprintf(stderr, "\n[DEBUG] After double block 0:\n");
@@ -1205,8 +1206,8 @@ float *flux_transformer_forward(flux_transformer_t *tf,
                              img_rope_cos, img_rope_sin,
                              txt_rope_cos, txt_rope_sin,
                              total_seq, txt_seq, tf);  /* txt_seq is the offset to image */
-        if (flux_substep_callback && ((i + 1) % 5 == 0))
-            flux_substep_callback('s');
+        if (flux_substep_callback)
+            flux_substep_callback(FLUX_SUBSTEP_SINGLE_BLOCK, i, tf->num_single_layers);
 
 #ifdef DEBUG_SINGLE_BLOCK
         if (i == 0 || i == 9 || i == 19) {
@@ -1273,7 +1274,8 @@ float *flux_transformer_forward(flux_transformer_t *tf,
     free(txt_rope_cos);
     free(txt_rope_sin);
 
-    if (flux_substep_callback) flux_substep_callback('F');
+    if (flux_substep_callback)
+        flux_substep_callback(FLUX_SUBSTEP_FINAL_LAYER, 0, 1);
 
     return output;
 }

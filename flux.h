@@ -201,11 +201,6 @@ void flux_set_seed(int64_t seed);
 const char *flux_model_info(flux_ctx *ctx);
 
 /*
- * Enable/disable verbose logging.
- */
-void flux_set_verbose(int verbose);
-
-/*
  * Get last error message.
  */
 const char *flux_get_error(void);

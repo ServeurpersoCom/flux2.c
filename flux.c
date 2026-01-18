@@ -23,9 +23,6 @@ typedef struct flux_vae flux_vae_t;
 typedef struct flux_transformer flux_transformer_t;
 typedef struct flux_text_encoder flux_text_encoder_t;
 
-/* Global verbose flag (defined in flux_sample.c, set by flux_set_verbose) */
-extern int g_verbose;
-
 /* Internal function declarations */
 extern flux_tokenizer *flux_tokenizer_load(const char *path);
 extern void flux_tokenizer_free(flux_tokenizer *tok);
@@ -481,12 +478,6 @@ float *flux_encode_text(flux_ctx *ctx, const char *prompt, int *out_seq_len) {
  * Image Generation
  * ======================================================================== */
 
-/* Substep progress callback - prints single character inline */
-static void default_substep_callback(char c) {
-    fputc(c, stderr);
-    fflush(stderr);
-}
-
 flux_image *flux_generate(flux_ctx *ctx, const char *prompt,
                           const flux_params *params) {
     if (!ctx || !prompt) {
@@ -539,9 +530,7 @@ flux_image *flux_generate(flux_ctx *ctx, const char *prompt,
     /* Get schedule */
     float *schedule = flux_linear_schedule(p.num_steps);
 
-    /* Sample with progress display */
-    if (g_verbose) flux_substep_callback = default_substep_callback;
-
+    /* Sample */
     float *latent = flux_sample_euler(
         ctx->transformer, ctx->text_encoder,
         z, 1, FLUX_LATENT_CHANNELS, latent_h, latent_w,
@@ -551,8 +540,6 @@ flux_image *flux_generate(flux_ctx *ctx, const char *prompt,
         p.guidance_scale,
         NULL
     );
-
-    flux_substep_callback = NULL;
 
     free(z);
     free(schedule);
@@ -654,12 +641,7 @@ flux_image *flux_generate_with_embeddings(flux_ctx *ctx,
         fprintf(stderr, "]\n");
     }
 
-    /* Sample with progress display */
-    if (g_verbose) flux_substep_callback = default_substep_callback;
-
-    struct timespec t_sample_start, t_sample_end, t_vae_start, t_vae_end;
-    clock_gettime(CLOCK_MONOTONIC, &t_sample_start);
-
+    /* Sample */
     float *latent = flux_sample_euler(
         ctx->transformer, ctx->text_encoder,
         z, 1, FLUX_LATENT_CHANNELS, latent_h, latent_w,
@@ -670,9 +652,6 @@ flux_image *flux_generate_with_embeddings(flux_ctx *ctx,
         NULL
     );
 
-    flux_substep_callback = NULL;
-    clock_gettime(CLOCK_MONOTONIC, &t_sample_end);
-
     free(z);
     free(schedule);
 
@@ -682,16 +661,9 @@ flux_image *flux_generate_with_embeddings(flux_ctx *ctx,
     }
 
     /* Decode latent to image */
-    clock_gettime(CLOCK_MONOTONIC, &t_vae_start);
     flux_image *img = NULL;
     if (ctx->vae) {
         img = flux_vae_decode(ctx->vae, latent, 1, latent_h, latent_w);
-        clock_gettime(CLOCK_MONOTONIC, &t_vae_end);
-        double sample_time = (t_sample_end.tv_sec - t_sample_start.tv_sec) +
-                             (t_sample_end.tv_nsec - t_sample_start.tv_nsec) / 1e9;
-        double vae_time = (t_vae_end.tv_sec - t_vae_start.tv_sec) +
-                          (t_vae_end.tv_nsec - t_vae_start.tv_nsec) / 1e9;
-        fprintf(stderr, "Timing: Transformer=%.2fs, VAE=%.2fs\n", sample_time, vae_time);
     } else {
         set_error("No VAE loaded");
         free(latent);
@@ -764,9 +736,7 @@ flux_image *flux_generate_with_embeddings_and_noise(flux_ctx *ctx,
         fprintf(stderr, "]\n");
     }
 
-    /* Sample with progress display */
-    if (g_verbose) flux_substep_callback = default_substep_callback;
-
+    /* Sample */
     float *latent = flux_sample_euler(
         ctx->transformer, ctx->text_encoder,
         z, 1, FLUX_LATENT_CHANNELS, latent_h, latent_w,
@@ -776,8 +746,6 @@ flux_image *flux_generate_with_embeddings_and_noise(flux_ctx *ctx,
         p.guidance_scale,
         NULL
     );
-
-    flux_substep_callback = NULL;
 
     free(z);
     free(schedule);
@@ -897,9 +865,7 @@ flux_image *flux_img2img(flux_ctx *ctx, const char *prompt,
         schedule[i] = strength * (1.0f - (float)i / num_steps);
     }
 
-    /* Sample with progress display */
-    if (g_verbose) flux_substep_callback = default_substep_callback;
-
+    /* Sample */
     float *latent = flux_sample_euler(
         ctx->transformer, ctx->text_encoder,
         img_latent, 1, FLUX_LATENT_CHANNELS, latent_h, latent_w,
@@ -907,8 +873,6 @@ flux_image *flux_img2img(flux_ctx *ctx, const char *prompt,
         schedule, num_steps,
         p.guidance_scale, NULL
     );
-
-    flux_substep_callback = NULL;
 
     free(img_latent);
     free(schedule);

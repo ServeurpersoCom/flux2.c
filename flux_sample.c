@@ -169,11 +169,9 @@ float *flux_sample_euler(void *transformer, void *text_encoder,
         float t_next = schedule[step + 1];
         float dt = t_next - t_curr;  /* Negative for denoising */
 
-        /* Print step progress header */
-        if (flux_substep_callback) {
-            fprintf(stderr, "Step %d... ", step + 1);
-            fflush(stderr);
-        }
+        /* Notify step start */
+        if (flux_step_callback)
+            flux_step_callback(step + 1, num_steps);
 
         /* Predict velocity with conditioning */
         v_cond = flux_transformer_forward(tf, z_curr, h, w,
@@ -196,11 +194,6 @@ float *flux_sample_euler(void *transformer, void *text_encoder,
         flux_axpy(z_curr, dt, v_cond, latent_size);
 
         free(v_cond);
-
-        /* End of step - print newline if showing substep progress */
-        if (flux_substep_callback) {
-            fprintf(stderr, "\n");
-        }
 
         if (progress_callback) {
             progress_callback(step + 1, num_steps);
@@ -414,27 +407,12 @@ float *flux_generate_latent(void *ctx_ptr,
 }
 
 /* ========================================================================
- * Progress and Logging
+ * Legacy Progress Callback (for backwards compatibility)
  * ======================================================================== */
 
-int g_verbose = 0;
-
-void flux_set_verbose(int verbose) {
-    g_verbose = verbose;
-}
-
-static void default_progress(int step, int total) {
-    if (g_verbose) {
-        fprintf(stderr, "\rStep %d/%d", step, total);
-        if (step == total) {
-            fprintf(stderr, "\n");
-        }
-        fflush(stderr);
-    }
-}
-
-void (*flux_progress_callback)(int, int) = default_progress;
+/* Legacy callback for step-level progress (called from sampling loop) */
+void (*flux_progress_callback)(int, int) = NULL;
 
 void flux_set_progress_callback(void (*callback)(int, int)) {
-    flux_progress_callback = callback ? callback : default_progress;
+    flux_progress_callback = callback;
 }

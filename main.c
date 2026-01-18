@@ -23,11 +23,67 @@
  */
 
 #include "flux.h"
+#include "flux_kernels.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <getopt.h>
 #include <time.h>
+
+/* ========================================================================
+ * CLI Progress Callbacks
+ * ======================================================================== */
+
+static int cli_current_step = 0;
+
+/* Called at the start of each sampling step */
+static void cli_step_callback(int step, int total) {
+    /* Print newline to end previous step's progress (if any) */
+    if (cli_current_step > 0) {
+        fprintf(stderr, "\n");
+    }
+    cli_current_step = step;
+    fprintf(stderr, "Step %d/%d ", step, total);
+    fflush(stderr);
+}
+
+/* Called for each substep within transformer forward */
+static void cli_substep_callback(flux_substep_type_t type, int index, int total) {
+    (void)total;  /* We could use this for more detailed progress */
+
+    switch (type) {
+        case FLUX_SUBSTEP_DOUBLE_BLOCK:
+            fputc('d', stderr);
+            break;
+        case FLUX_SUBSTEP_SINGLE_BLOCK:
+            /* Print 's' every 5 single blocks to avoid too much output */
+            if ((index + 1) % 5 == 0) {
+                fputc('s', stderr);
+            }
+            break;
+        case FLUX_SUBSTEP_FINAL_LAYER:
+            fputc('F', stderr);
+            break;
+    }
+    fflush(stderr);
+}
+
+/* Set up CLI progress callbacks */
+static void cli_setup_progress(void) {
+    cli_current_step = 0;
+    flux_step_callback = cli_step_callback;
+    flux_substep_callback = cli_substep_callback;
+}
+
+/* Clean up after generation (print final newline) */
+static void cli_finish_progress(void) {
+    if (cli_current_step > 0) {
+        fprintf(stderr, "\n");
+        cli_current_step = 0;
+    }
+    flux_step_callback = NULL;
+    flux_substep_callback = NULL;
+}
 
 /* Default values */
 #define DEFAULT_WIDTH 1024
@@ -247,13 +303,13 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
-    /* Set verbose mode on context */
-    flux_set_verbose(verbose);
-
     if (verbose) {
         double load_time = (double)(clock() - start) / CLOCKS_PER_SEC;
         fprintf(stderr, "Model loaded in %.2f seconds\n", load_time);
         fprintf(stderr, "Model info: %s\n\n", flux_model_info(ctx));
+
+        /* Set up progress callbacks for verbose mode */
+        cli_setup_progress();
     }
 
     /* Set seed */
@@ -385,6 +441,11 @@ int main(int argc, char *argv[]) {
         }
 
         output = flux_generate(ctx, prompt, &params);
+    }
+
+    /* Finish progress display */
+    if (verbose) {
+        cli_finish_progress();
     }
 
     if (!output) {
