@@ -196,7 +196,7 @@ Benchmarks on **Apple M3 Max** (128GB RAM), generating a 4-step image:
 | 64x64 | 25.0s | 23.5s | 605.6s | 2.2s |
 
 **Notes:**
-- The C implementation uses float32 throughout, while PyTorch uses bfloat16 with highly optimized MPS kernels. The next step of this project is likely to implement such an optimization, in order to reach similar speed, or at least try to approach it.
+- The C implementation uses float32 throughout, while PyTorch uses bfloat16 with highly optimized MPS kernels. The next step of this project is likely to implement such an optimization, in order to reach similar speed, or at least try to approach it. Notably, we currently don't take activations on the GPU between operations: this is likely going to require some serious refactoring, and it is essential to improve speed significantly.
 - The generic (pure C) backend is extremely slow and only practical for testing at small sizes.
 - Times include text encoding, denoising (4 steps), and VAE decode.
 
