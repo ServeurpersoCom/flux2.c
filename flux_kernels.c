@@ -392,35 +392,6 @@ int flux_gpu_in_batch(void) {
  * Convolution Operations
  * ======================================================================== */
 
-#ifdef USE_BLAS
-/* im2col: Extract patches from input image into columns for BLAS matmul */
-static void im2col(const float *in, float *col,
-                   int in_ch, int H, int W,
-                   int kH, int kW, int stride, int padding,
-                   int outH, int outW) {
-    int col_row = 0;
-    for (int ic = 0; ic < in_ch; ic++) {
-        for (int kh = 0; kh < kH; kh++) {
-            for (int kw = 0; kw < kW; kw++) {
-                for (int oh = 0; oh < outH; oh++) {
-                    for (int ow = 0; ow < outW; ow++) {
-                        int ih = oh * stride - padding + kh;
-                        int iw = ow * stride - padding + kw;
-                        int col_idx = col_row * (outH * outW) + oh * outW + ow;
-                        if (ih >= 0 && ih < H && iw >= 0 && iw < W) {
-                            col[col_idx] = in[ic * H * W + ih * W + iw];
-                        } else {
-                            col[col_idx] = 0.0f;
-                        }
-                    }
-                }
-                col_row++;
-            }
-        }
-    }
-}
-#endif /* USE_BLAS */
-
 void flux_conv2d(float *out, const float *in, const float *weight, const float *bias,
                  int batch, int in_ch, int out_ch, int H, int W,
                  int kH, int kW, int stride, int padding) {
