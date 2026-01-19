@@ -41,6 +41,56 @@ static int g_in_batch = 0;
 static pending_output_t g_pending_outputs[MAX_BATCH_OUTPUTS];
 static int g_pending_count = 0;
 
+/* Input buffer cache - during batch mode, cache input buffers to avoid
+ * redundant copies when the same tensor is used as input to multiple ops */
+#define MAX_BATCH_INPUTS 64
+
+typedef struct {
+    const void *cpu_ptr;       /* CPU pointer (key) */
+    id<MTLBuffer> gpu_buffer;  /* GPU buffer with copied data */
+    size_t size;               /* Buffer size */
+} batch_input_entry_t;
+
+static batch_input_entry_t g_batch_inputs[MAX_BATCH_INPUTS];
+static int g_batch_input_count = 0;
+
+/* Forward declaration */
+static id<MTLBuffer> pool_get_buffer(size_t size);
+
+/* Get or create an input buffer during batch mode */
+static id<MTLBuffer> batch_get_input_buffer(const void *cpu_ptr, size_t size) {
+    if (!g_in_batch) return nil;
+
+    /* Check if already in cache */
+    for (int i = 0; i < g_batch_input_count; i++) {
+        if (g_batch_inputs[i].cpu_ptr == cpu_ptr &&
+            g_batch_inputs[i].size == size) {
+            return g_batch_inputs[i].gpu_buffer;
+        }
+    }
+
+    /* Not in cache - create new entry */
+    if (g_batch_input_count >= MAX_BATCH_INPUTS) {
+        return nil;  /* Cache full */
+    }
+
+    id<MTLBuffer> buffer = pool_get_buffer(size);
+    if (!buffer) return nil;
+
+    memcpy([buffer contents], cpu_ptr, size);
+
+    g_batch_inputs[g_batch_input_count].cpu_ptr = cpu_ptr;
+    g_batch_inputs[g_batch_input_count].gpu_buffer = buffer;
+    g_batch_inputs[g_batch_input_count].size = size;
+    g_batch_input_count++;
+
+    return buffer;
+}
+
+/* Forward declarations for compute shaders (defined later) */
+static id<MTLComputePipelineState> g_softmax_pipeline;
+static int g_shaders_initialized;
+
 /* ========================================================================
  * Weight Buffer Cache
  * Cache GPU buffers for weight matrices to avoid repeated allocations.
@@ -296,6 +346,7 @@ void flux_metal_end_batch(void) {
         }
         g_in_batch = 0;
         g_pending_count = 0;
+        g_batch_input_count = 0;  /* Clear input cache */
 
         /* Release all pooled buffers back to pool */
         pool_release_all();
@@ -336,19 +387,28 @@ void flux_metal_sgemm(int transpose_a, int transpose_b,
          */
         id<MTLBuffer> bufferB = get_cached_weight_buffer(B, sizeB);
 
-        /* Use pooled buffers for activations */
-        id<MTLBuffer> bufferA = pool_get_buffer(sizeA);
+        /* Use cached input buffer if in batch mode, otherwise allocate fresh */
+        id<MTLBuffer> bufferA = nil;
+        int bufferA_from_cache = 0;
+        if (g_in_batch) {
+            bufferA = batch_get_input_buffer(A, sizeA);
+            bufferA_from_cache = (bufferA != nil);
+        }
+        if (!bufferA) {
+            bufferA = pool_get_buffer(sizeA);
+            if (bufferA) {
+                memcpy([bufferA contents], A, sizeA);
+            }
+        }
+
         id<MTLBuffer> bufferC = pool_get_buffer(sizeC);
 
         if (!bufferA || !bufferB || !bufferC) {
             /* Fallback if buffer creation fails */
-            if (bufferA) pool_release_buffer(bufferA);
+            if (bufferA && !bufferA_from_cache) pool_release_buffer(bufferA);
             if (bufferC) pool_release_buffer(bufferC);
             return;
         }
-
-        /* Copy input A to GPU buffer */
-        memcpy([bufferA contents], A, sizeA);
 
         /* Initialize C if beta != 0 */
         if (beta != 0.0f) {
@@ -405,14 +465,18 @@ void flux_metal_sgemm(int transpose_a, int transpose_b,
                 g_pending_outputs[g_pending_count].cpu_ptr = C;
                 g_pending_outputs[g_pending_count].size = sizeC;
                 g_pending_count++;
-                /* bufferA can be released immediately after encoding */
-                pool_release_buffer(bufferA);
+                /* Don't release bufferA if it came from batch input cache */
+                if (!bufferA_from_cache) {
+                    pool_release_buffer(bufferA);
+                }
             } else {
                 /* Too many pending outputs - fall back to immediate sync */
                 [cmdBuffer commit];
                 [cmdBuffer waitUntilCompleted];
                 memcpy(C, [bufferC contents], sizeC);
-                pool_release_buffer(bufferA);
+                if (!bufferA_from_cache) {
+                    pool_release_buffer(bufferA);
+                }
                 pool_release_buffer(bufferC);
             }
         } else {
@@ -553,17 +617,28 @@ void flux_metal_sgemm_bf16(int transpose_a, int transpose_b,
         /* Get cached f16 weight buffer (bf16 converted to f16) */
         id<MTLBuffer> bufferB = get_cached_bf16_as_f16_buffer(B_bf16, numB);
 
-        /* Use pooled buffers for activations */
-        id<MTLBuffer> bufferA = pool_get_buffer(sizeA);
+        /* Use cached input buffer if in batch mode, otherwise allocate fresh */
+        id<MTLBuffer> bufferA = nil;
+        int bufferA_from_cache = 0;
+        if (g_in_batch) {
+            bufferA = batch_get_input_buffer(A, sizeA);
+            bufferA_from_cache = (bufferA != nil);
+        }
+        if (!bufferA) {
+            bufferA = pool_get_buffer(sizeA);
+            if (bufferA) {
+                memcpy([bufferA contents], A, sizeA);
+            }
+        }
+
         id<MTLBuffer> bufferC = pool_get_buffer(sizeC);
 
         if (!bufferA || !bufferB || !bufferC) {
-            if (bufferA) pool_release_buffer(bufferA);
+            if (bufferA && !bufferA_from_cache) pool_release_buffer(bufferA);
             if (bufferC) pool_release_buffer(bufferC);
             return;
         }
 
-        memcpy([bufferA contents], A, sizeA);
         if (beta != 0.0f) {
             memcpy([bufferC contents], C, sizeC);
         }
@@ -611,12 +686,17 @@ void flux_metal_sgemm_bf16(int transpose_a, int transpose_b,
                 g_pending_outputs[g_pending_count].cpu_ptr = C;
                 g_pending_outputs[g_pending_count].size = sizeC;
                 g_pending_count++;
-                pool_release_buffer(bufferA);
+                /* Don't release bufferA if it came from batch input cache */
+                if (!bufferA_from_cache) {
+                    pool_release_buffer(bufferA);
+                }
             } else {
                 [cmdBuffer commit];
                 [cmdBuffer waitUntilCompleted];
                 memcpy(C, [bufferC contents], sizeC);
-                pool_release_buffer(bufferA);
+                if (!bufferA_from_cache) {
+                    pool_release_buffer(bufferA);
+                }
                 pool_release_buffer(bufferC);
             }
         } else {
@@ -727,17 +807,15 @@ size_t flux_metal_memory_used(void) {
     return [g_device currentAllocatedSize];
 }
 
-/* External softmax function from flux_kernels.c */
-extern void flux_softmax(float *x, int rows, int cols);
-
 /*
  * GPU-accelerated attention with batched heads.
  * Does: out = softmax(Q @ K^T * scale) @ V for all heads in parallel.
+ * Uses GPU softmax shader to avoid CPU roundtrip.
  *
  * Q: [heads, seq_q, head_dim]
  * K: [heads, seq_k, head_dim]
  * V: [heads, seq_k, head_dim]
- * scores_scratch: [heads * seq_q * seq_k]
+ * scores_scratch: [heads * seq_q * seq_k] (unused when GPU softmax available)
  * out: [heads, seq_q, head_dim]
  */
 void flux_metal_attention(float *out,
@@ -776,10 +854,14 @@ void flux_metal_attention(float *out,
             return;
         }
 
+        /* Check if GPU softmax is available */
+        int use_gpu_softmax = g_shaders_initialized && g_softmax_pipeline;
+
+        /* Single command buffer for all operations when GPU softmax is available */
+        id<MTLCommandBuffer> cmdBuffer = [g_queue commandBuffer];
+
         /* === Phase 1: Batched Q @ K^T === */
         {
-            id<MTLCommandBuffer> cmdBuffer = [g_queue commandBuffer];
-
             /* Descriptors for single head matrices */
             MPSMatrixDescriptor *descQ = [MPSMatrixDescriptor
                 matrixDescriptorWithRows:seq_q columns:head_dim
@@ -823,26 +905,45 @@ void flux_metal_attention(float *out,
                                      rightMatrix:matK
                                     resultMatrix:matScores];
             }
+        }
 
+        /* === Phase 2: Softmax === */
+        if (use_gpu_softmax) {
+            /* GPU softmax - encode to same command buffer */
+            id<MTLComputeCommandEncoder> encoder = [cmdBuffer computeCommandEncoder];
+
+            [encoder setComputePipelineState:g_softmax_pipeline];
+            [encoder setBuffer:bufScores offset:0 atIndex:0];
+
+            /* Process each head's scores (rows = seq_q, cols = seq_k) */
+            int total_rows = heads * seq_q;
+            [encoder setBytes:&total_rows length:sizeof(int) atIndex:1];
+            [encoder setBytes:&seq_k length:sizeof(int) atIndex:2];
+
+            NSUInteger threadsPerGroup = MIN(256, (NSUInteger)seq_k);
+            [encoder dispatchThreadgroups:MTLSizeMake(total_rows, 1, 1)
+                    threadsPerThreadgroup:MTLSizeMake(threadsPerGroup, 1, 1)];
+
+            [encoder endEncoding];
+        } else {
+            /* CPU softmax fallback - sync required */
             [cmdBuffer commit];
             [cmdBuffer waitUntilCompleted];
+
+            /* Copy, softmax on CPU, copy back */
+            memcpy(scores_scratch, [bufScores contents], sizeScores);
+            extern void flux_softmax(float *x, int rows, int cols);
+            for (int h = 0; h < heads; h++) {
+                flux_softmax(scores_scratch + h * scores_stride, seq_q, seq_k);
+            }
+            memcpy([bufScores contents], scores_scratch, sizeScores);
+
+            /* New command buffer for phase 3 */
+            cmdBuffer = [g_queue commandBuffer];
         }
-
-        /* Copy scores to CPU scratch buffer */
-        memcpy(scores_scratch, [bufScores contents], sizeScores);
-
-        /* === Phase 2: Softmax on CPU (per head, per row) === */
-        for (int h = 0; h < heads; h++) {
-            flux_softmax(scores_scratch + h * scores_stride, seq_q, seq_k);
-        }
-
-        /* Copy softmax results back to GPU */
-        memcpy([bufScores contents], scores_scratch, sizeScores);
 
         /* === Phase 3: Batched scores @ V === */
         {
-            id<MTLCommandBuffer> cmdBuffer = [g_queue commandBuffer];
-
             MPSMatrixDescriptor *descScores = [MPSMatrixDescriptor
                 matrixDescriptorWithRows:seq_q columns:seq_k
                                 rowBytes:seq_k * sizeof(float)
@@ -885,12 +986,11 @@ void flux_metal_attention(float *out,
                                      rightMatrix:matV
                                     resultMatrix:matOut];
             }
-
-            [cmdBuffer commit];
-            [cmdBuffer waitUntilCompleted];
         }
 
-        /* Copy output back to CPU */
+        /* Execute and copy output back to CPU */
+        [cmdBuffer commit];
+        [cmdBuffer waitUntilCompleted];
         memcpy(out, [bufOut contents], sizeOut);
     }
 }
