@@ -1320,6 +1320,83 @@ flux_gpu_tensor_t flux_gpu_linear(flux_gpu_tensor_t x,
     }
 }
 
+/* GPU linear with bf16 weights - returns GPU tensor (stays on GPU) */
+flux_gpu_tensor_t flux_gpu_linear_bf16(flux_gpu_tensor_t x,
+                                        const uint16_t *W_bf16,
+                                        int seq_len, int in_dim, int out_dim) {
+    if (!g_initialized || !x || !W_bf16) return NULL;
+
+    @autoreleasepool {
+        size_t out_elements = (size_t)seq_len * out_dim;
+        flux_gpu_tensor_t out = flux_gpu_tensor_alloc(out_elements);
+        if (!out) return NULL;
+
+        /* Get cached f16 weight buffer (bf16 converted to f16) */
+        size_t numW = (size_t)out_dim * in_dim;
+        id<MTLBuffer> bufW = get_cached_bf16_as_f16_buffer(W_bf16, numW);
+        if (!bufW) {
+            flux_gpu_tensor_free(out);
+            return NULL;
+        }
+
+        /* Create matrix descriptors
+         * x: [seq_len, in_dim] (f32)
+         * W: [out_dim, in_dim] (f16, need to transpose for x @ W^T)
+         * out: [seq_len, out_dim] (f32)
+         */
+        MPSMatrixDescriptor *descX = [MPSMatrixDescriptor
+            matrixDescriptorWithRows:seq_len columns:in_dim
+                            rowBytes:in_dim * sizeof(float)
+                            dataType:MPSDataTypeFloat32];
+        MPSMatrixDescriptor *descW = [MPSMatrixDescriptor
+            matrixDescriptorWithRows:out_dim columns:in_dim
+                            rowBytes:in_dim * sizeof(uint16_t)
+                            dataType:MPSDataTypeFloat16];
+        MPSMatrixDescriptor *descOut = [MPSMatrixDescriptor
+            matrixDescriptorWithRows:seq_len columns:out_dim
+                            rowBytes:out_dim * sizeof(float)
+                            dataType:MPSDataTypeFloat32];
+
+        MPSMatrix *matX = [[MPSMatrix alloc] initWithBuffer:x->buffer descriptor:descX];
+        MPSMatrix *matW = [[MPSMatrix alloc] initWithBuffer:bufW descriptor:descW];
+        MPSMatrix *matOut = [[MPSMatrix alloc] initWithBuffer:out->buffer descriptor:descOut];
+
+        /* Create matmul: out = x @ W^T */
+        MPSMatrixMultiplication *matmul = [[MPSMatrixMultiplication alloc]
+            initWithDevice:g_device
+               transposeLeft:NO
+              transposeRight:YES
+                  resultRows:seq_len
+               resultColumns:out_dim
+             interiorColumns:in_dim
+                       alpha:1.0f
+                        beta:0.0f];
+
+        id<MTLCommandBuffer> cmdBuffer = get_tensor_cmd();
+        [matmul encodeToCommandBuffer:cmdBuffer
+                           leftMatrix:matX
+                          rightMatrix:matW
+                         resultMatrix:matOut];
+
+        /* Mark output as having pending work */
+        out->has_pending_work = 1;
+
+        if (!g_tensor_batch_mode) {
+            /* Not in batch mode - sync immediately */
+            [cmdBuffer commit];
+            [cmdBuffer waitUntilCompleted];
+            out->has_pending_work = 0;
+        }
+
+        /* Mark input as having pending work if in batch mode */
+        if (g_tensor_batch_mode) {
+            x->has_pending_work = 1;
+        }
+
+        return out;
+    }
+}
+
 /* ========================================================================
  * Compute Shader Support
  * Custom Metal compute shaders for element-wise operations.
@@ -1336,6 +1413,9 @@ static id<MTLComputePipelineState> g_softmax_pipeline = nil;
 static id<MTLComputePipelineState> g_rope_2d_pipeline = nil;
 static id<MTLComputePipelineState> g_causal_attention_pipeline = nil;
 static id<MTLComputePipelineState> g_attention_fused_pipeline = nil;
+static id<MTLComputePipelineState> g_gated_add_pipeline = nil;
+static id<MTLComputePipelineState> g_split_qkv_mlp_pipeline = nil;
+static id<MTLComputePipelineState> g_concat_attn_mlp_pipeline = nil;
 static int g_shaders_initialized = 0;
 
 int flux_metal_shaders_available(void) {
@@ -1488,6 +1568,33 @@ int flux_metal_init_shaders(void) {
             g_attention_fused_pipeline = [g_device newComputePipelineStateWithFunction:func error:&error];
             if (!g_attention_fused_pipeline) {
                 fprintf(stderr, "Metal shaders: attention_fused pipeline failed: %s\n",
+                        [[error localizedDescription] UTF8String]);
+            }
+        }
+
+        func = [g_shader_library newFunctionWithName:@"gated_add"];
+        if (func) {
+            g_gated_add_pipeline = [g_device newComputePipelineStateWithFunction:func error:&error];
+            if (!g_gated_add_pipeline) {
+                fprintf(stderr, "Metal shaders: gated_add pipeline failed: %s\n",
+                        [[error localizedDescription] UTF8String]);
+            }
+        }
+
+        func = [g_shader_library newFunctionWithName:@"split_qkv_mlp"];
+        if (func) {
+            g_split_qkv_mlp_pipeline = [g_device newComputePipelineStateWithFunction:func error:&error];
+            if (!g_split_qkv_mlp_pipeline) {
+                fprintf(stderr, "Metal shaders: split_qkv_mlp pipeline failed: %s\n",
+                        [[error localizedDescription] UTF8String]);
+            }
+        }
+
+        func = [g_shader_library newFunctionWithName:@"concat_attn_mlp"];
+        if (func) {
+            g_concat_attn_mlp_pipeline = [g_device newComputePipelineStateWithFunction:func error:&error];
+            if (!g_concat_attn_mlp_pipeline) {
+                fprintf(stderr, "Metal shaders: concat_attn_mlp pipeline failed: %s\n",
                         [[error localizedDescription] UTF8String]);
             }
         }
@@ -1859,6 +1966,353 @@ void flux_metal_rope_2d(float *x, const float *cos_freq, const float *sin_freq,
         pool_release_buffer(bufX);
         pool_release_buffer(bufCos);
         pool_release_buffer(bufSin);
+    }
+}
+
+/* ========================================================================
+ * GPU Tensor Operations - Keep data on GPU between operations
+ * These functions take GPU tensors and return GPU tensors.
+ * ======================================================================== */
+
+/* GPU tensor version of AdaLN normalization */
+void flux_gpu_adaln_norm(flux_gpu_tensor_t out, flux_gpu_tensor_t x,
+                         const float *shift, const float *scale,
+                         int seq, int hidden, float eps) {
+    if (!g_shaders_initialized || !g_adaln_norm_pipeline || !out || !x) return;
+
+    @autoreleasepool {
+        size_t param_size = (size_t)hidden * sizeof(float);
+
+        /* Get cached buffers for shift/scale parameters */
+        id<MTLBuffer> bufShift = get_cached_weight_buffer(shift, param_size);
+        id<MTLBuffer> bufScale = get_cached_weight_buffer(scale, param_size);
+
+        if (!bufShift || !bufScale) return;
+
+        id<MTLCommandBuffer> cmdBuffer = get_tensor_cmd();
+        id<MTLComputeCommandEncoder> encoder = [cmdBuffer computeCommandEncoder];
+
+        [encoder setComputePipelineState:g_adaln_norm_pipeline];
+        [encoder setBuffer:x->buffer offset:0 atIndex:0];
+        [encoder setBuffer:bufShift offset:0 atIndex:1];
+        [encoder setBuffer:bufScale offset:0 atIndex:2];
+        [encoder setBuffer:out->buffer offset:0 atIndex:3];
+        [encoder setBytes:&hidden length:sizeof(int) atIndex:4];
+        [encoder setBytes:&eps length:sizeof(float) atIndex:5];
+
+        NSUInteger threadsPerGroup = MIN(256, (NSUInteger)hidden);
+        [encoder dispatchThreadgroups:MTLSizeMake(seq, 1, 1)
+                threadsPerThreadgroup:MTLSizeMake(threadsPerGroup, 1, 1)];
+
+        [encoder endEncoding];
+
+        out->has_pending_work = 1;
+        x->has_pending_work = 1;
+
+        if (!g_tensor_batch_mode) {
+            [cmdBuffer commit];
+            [cmdBuffer waitUntilCompleted];
+            out->has_pending_work = 0;
+            x->has_pending_work = 0;
+        }
+    }
+}
+
+/* GPU tensor version of QK RMSNorm */
+void flux_gpu_qk_rms_norm(flux_gpu_tensor_t q, flux_gpu_tensor_t k,
+                          const float *q_weight, const float *k_weight,
+                          int seq, int heads, int head_dim, float eps) {
+    if (!g_shaders_initialized || !g_qk_rms_norm_pipeline || !q || !k) return;
+
+    @autoreleasepool {
+        size_t weight_size = (size_t)head_dim * sizeof(float);
+
+        id<MTLBuffer> bufQWeight = get_cached_weight_buffer(q_weight, weight_size);
+        id<MTLBuffer> bufKWeight = get_cached_weight_buffer(k_weight, weight_size);
+
+        if (!bufQWeight || !bufKWeight) return;
+
+        id<MTLCommandBuffer> cmdBuffer = get_tensor_cmd();
+        id<MTLComputeCommandEncoder> encoder = [cmdBuffer computeCommandEncoder];
+
+        [encoder setComputePipelineState:g_qk_rms_norm_pipeline];
+        [encoder setBuffer:q->buffer offset:0 atIndex:0];
+        [encoder setBuffer:k->buffer offset:0 atIndex:1];
+        [encoder setBuffer:bufQWeight offset:0 atIndex:2];
+        [encoder setBuffer:bufKWeight offset:0 atIndex:3];
+        [encoder setBytes:&heads length:sizeof(int) atIndex:4];
+        [encoder setBytes:&head_dim length:sizeof(int) atIndex:5];
+        [encoder setBytes:&eps length:sizeof(float) atIndex:6];
+
+        [encoder dispatchThreads:MTLSizeMake(seq, heads, 1)
+           threadsPerThreadgroup:MTLSizeMake(1, MIN(heads, 64), 1)];
+
+        [encoder endEncoding];
+
+        q->has_pending_work = 1;
+        k->has_pending_work = 1;
+
+        if (!g_tensor_batch_mode) {
+            [cmdBuffer commit];
+            [cmdBuffer waitUntilCompleted];
+            q->has_pending_work = 0;
+            k->has_pending_work = 0;
+        }
+    }
+}
+
+/* GPU tensor version of RoPE 2D */
+void flux_gpu_rope_2d(flux_gpu_tensor_t x, const float *cos_freq, const float *sin_freq,
+                      int seq, int heads, int head_dim, int axis_dim) {
+    if (!g_shaders_initialized || !g_rope_2d_pipeline || !x) return;
+
+    @autoreleasepool {
+        size_t freq_size = (size_t)seq * head_dim * sizeof(float);
+
+        id<MTLBuffer> bufCos = pool_get_buffer(freq_size);
+        id<MTLBuffer> bufSin = pool_get_buffer(freq_size);
+
+        if (!bufCos || !bufSin) {
+            if (bufCos) pool_release_buffer(bufCos);
+            if (bufSin) pool_release_buffer(bufSin);
+            return;
+        }
+
+        memcpy([bufCos contents], cos_freq, freq_size);
+        memcpy([bufSin contents], sin_freq, freq_size);
+
+        id<MTLCommandBuffer> cmdBuffer = get_tensor_cmd();
+        id<MTLComputeCommandEncoder> encoder = [cmdBuffer computeCommandEncoder];
+
+        [encoder setComputePipelineState:g_rope_2d_pipeline];
+        [encoder setBuffer:x->buffer offset:0 atIndex:0];
+        [encoder setBuffer:bufCos offset:0 atIndex:1];
+        [encoder setBuffer:bufSin offset:0 atIndex:2];
+        [encoder setBytes:&seq length:sizeof(int) atIndex:3];
+        [encoder setBytes:&heads length:sizeof(int) atIndex:4];
+        [encoder setBytes:&head_dim length:sizeof(int) atIndex:5];
+        [encoder setBytes:&axis_dim length:sizeof(int) atIndex:6];
+
+        [encoder dispatchThreads:MTLSizeMake(seq, heads, 1)
+           threadsPerThreadgroup:MTLSizeMake(1, MIN(heads, 64), 1)];
+
+        [encoder endEncoding];
+
+        x->has_pending_work = 1;
+
+        if (!g_tensor_batch_mode) {
+            [cmdBuffer commit];
+            [cmdBuffer waitUntilCompleted];
+            x->has_pending_work = 0;
+        }
+
+        pool_release_buffer(bufCos);
+        pool_release_buffer(bufSin);
+    }
+}
+
+/* GPU tensor version of SiLU multiply */
+void flux_gpu_silu_mul(flux_gpu_tensor_t gate, flux_gpu_tensor_t up, int n) {
+    if (!g_shaders_initialized || !g_silu_mul_pipeline || !gate || !up) return;
+
+    @autoreleasepool {
+        id<MTLCommandBuffer> cmdBuffer = get_tensor_cmd();
+        id<MTLComputeCommandEncoder> encoder = [cmdBuffer computeCommandEncoder];
+
+        [encoder setComputePipelineState:g_silu_mul_pipeline];
+        [encoder setBuffer:gate->buffer offset:0 atIndex:0];
+        [encoder setBuffer:up->buffer offset:0 atIndex:1];
+        [encoder setBytes:&n length:sizeof(int) atIndex:2];
+
+        NSUInteger threads = MIN(256, (NSUInteger)n);
+        [encoder dispatchThreads:MTLSizeMake(n, 1, 1)
+           threadsPerThreadgroup:MTLSizeMake(threads, 1, 1)];
+
+        [encoder endEncoding];
+
+        gate->has_pending_work = 1;
+        up->has_pending_work = 1;
+
+        if (!g_tensor_batch_mode) {
+            [cmdBuffer commit];
+            [cmdBuffer waitUntilCompleted];
+            gate->has_pending_work = 0;
+            up->has_pending_work = 0;
+        }
+    }
+}
+
+/* GPU tensor version of gated add: out += gate * proj */
+void flux_gpu_gated_add(flux_gpu_tensor_t out, const float *gate,
+                        flux_gpu_tensor_t proj, int seq, int hidden) {
+    if (!g_shaders_initialized || !g_gated_add_pipeline || !out || !proj) return;
+
+    @autoreleasepool {
+        size_t gate_size = (size_t)hidden * sizeof(float);
+        id<MTLBuffer> bufGate = get_cached_weight_buffer(gate, gate_size);
+
+        if (!bufGate) return;
+
+        id<MTLCommandBuffer> cmdBuffer = get_tensor_cmd();
+        id<MTLComputeCommandEncoder> encoder = [cmdBuffer computeCommandEncoder];
+
+        [encoder setComputePipelineState:g_gated_add_pipeline];
+        [encoder setBuffer:out->buffer offset:0 atIndex:0];
+        [encoder setBuffer:bufGate offset:0 atIndex:1];
+        [encoder setBuffer:proj->buffer offset:0 atIndex:2];
+        [encoder setBytes:&seq length:sizeof(int) atIndex:3];
+        [encoder setBytes:&hidden length:sizeof(int) atIndex:4];
+
+        [encoder dispatchThreads:MTLSizeMake(seq, hidden, 1)
+           threadsPerThreadgroup:MTLSizeMake(MIN(32, seq), MIN(32, hidden), 1)];
+
+        [encoder endEncoding];
+
+        out->has_pending_work = 1;
+        proj->has_pending_work = 1;
+
+        if (!g_tensor_batch_mode) {
+            [cmdBuffer commit];
+            [cmdBuffer waitUntilCompleted];
+            out->has_pending_work = 0;
+            proj->has_pending_work = 0;
+        }
+    }
+}
+
+/* Split fused QKV+MLP output into separate tensors */
+void flux_gpu_split_qkv_mlp(flux_gpu_tensor_t fused,
+                            flux_gpu_tensor_t q, flux_gpu_tensor_t k, flux_gpu_tensor_t v,
+                            flux_gpu_tensor_t gate, flux_gpu_tensor_t up,
+                            int seq, int hidden, int mlp_hidden) {
+    if (!g_shaders_initialized || !g_split_qkv_mlp_pipeline) return;
+    if (!fused || !q || !k || !v || !gate || !up) return;
+
+    @autoreleasepool {
+        id<MTLCommandBuffer> cmdBuffer = get_tensor_cmd();
+        id<MTLComputeCommandEncoder> encoder = [cmdBuffer computeCommandEncoder];
+
+        [encoder setComputePipelineState:g_split_qkv_mlp_pipeline];
+        [encoder setBuffer:fused->buffer offset:0 atIndex:0];
+        [encoder setBuffer:q->buffer offset:0 atIndex:1];
+        [encoder setBuffer:k->buffer offset:0 atIndex:2];
+        [encoder setBuffer:v->buffer offset:0 atIndex:3];
+        [encoder setBuffer:gate->buffer offset:0 atIndex:4];
+        [encoder setBuffer:up->buffer offset:0 atIndex:5];
+        [encoder setBytes:&seq length:sizeof(int) atIndex:6];
+        [encoder setBytes:&hidden length:sizeof(int) atIndex:7];
+        [encoder setBytes:&mlp_hidden length:sizeof(int) atIndex:8];
+
+        /* Dispatch enough threads to cover max(hidden, mlp_hidden) */
+        int max_dim = MAX(hidden, mlp_hidden);
+        [encoder dispatchThreads:MTLSizeMake(seq, max_dim, 1)
+           threadsPerThreadgroup:MTLSizeMake(MIN(32, seq), MIN(32, max_dim), 1)];
+
+        [encoder endEncoding];
+
+        fused->has_pending_work = 1;
+        q->has_pending_work = 1;
+        k->has_pending_work = 1;
+        v->has_pending_work = 1;
+        gate->has_pending_work = 1;
+        up->has_pending_work = 1;
+
+        if (!g_tensor_batch_mode) {
+            [cmdBuffer commit];
+            [cmdBuffer waitUntilCompleted];
+            fused->has_pending_work = 0;
+            q->has_pending_work = 0;
+            k->has_pending_work = 0;
+            v->has_pending_work = 0;
+            gate->has_pending_work = 0;
+            up->has_pending_work = 0;
+        }
+    }
+}
+
+/* Concatenate attention and MLP outputs */
+void flux_gpu_concat_attn_mlp(flux_gpu_tensor_t attn, flux_gpu_tensor_t mlp,
+                              flux_gpu_tensor_t out, int seq, int hidden, int mlp_hidden) {
+    if (!g_shaders_initialized || !g_concat_attn_mlp_pipeline) return;
+    if (!attn || !mlp || !out) return;
+
+    @autoreleasepool {
+        id<MTLCommandBuffer> cmdBuffer = get_tensor_cmd();
+        id<MTLComputeCommandEncoder> encoder = [cmdBuffer computeCommandEncoder];
+
+        [encoder setComputePipelineState:g_concat_attn_mlp_pipeline];
+        [encoder setBuffer:attn->buffer offset:0 atIndex:0];
+        [encoder setBuffer:mlp->buffer offset:0 atIndex:1];
+        [encoder setBuffer:out->buffer offset:0 atIndex:2];
+        [encoder setBytes:&seq length:sizeof(int) atIndex:3];
+        [encoder setBytes:&hidden length:sizeof(int) atIndex:4];
+        [encoder setBytes:&mlp_hidden length:sizeof(int) atIndex:5];
+
+        /* Dispatch enough threads to cover max(hidden, mlp_hidden) */
+        int max_dim = MAX(hidden, mlp_hidden);
+        [encoder dispatchThreads:MTLSizeMake(seq, max_dim, 1)
+           threadsPerThreadgroup:MTLSizeMake(MIN(32, seq), MIN(32, max_dim), 1)];
+
+        [encoder endEncoding];
+
+        attn->has_pending_work = 1;
+        mlp->has_pending_work = 1;
+        out->has_pending_work = 1;
+
+        if (!g_tensor_batch_mode) {
+            [cmdBuffer commit];
+            [cmdBuffer waitUntilCompleted];
+            attn->has_pending_work = 0;
+            mlp->has_pending_work = 0;
+            out->has_pending_work = 0;
+        }
+    }
+}
+
+/* GPU tensor version of fused attention (no transpose needed) */
+int flux_gpu_attention_fused(flux_gpu_tensor_t out,
+                             flux_gpu_tensor_t Q, flux_gpu_tensor_t K, flux_gpu_tensor_t V,
+                             int seq_q, int seq_k, int num_heads, int head_dim, float scale) {
+    if (!g_shaders_initialized || !g_attention_fused_pipeline) return 0;
+    if (!out || !Q || !K || !V) return 0;
+    if (seq_k > 1024) return 0;  /* Limit for shared memory */
+
+    @autoreleasepool {
+        id<MTLCommandBuffer> cmdBuffer = get_tensor_cmd();
+        id<MTLComputeCommandEncoder> encoder = [cmdBuffer computeCommandEncoder];
+
+        [encoder setComputePipelineState:g_attention_fused_pipeline];
+        [encoder setBuffer:Q->buffer offset:0 atIndex:0];
+        [encoder setBuffer:K->buffer offset:0 atIndex:1];
+        [encoder setBuffer:V->buffer offset:0 atIndex:2];
+        [encoder setBuffer:out->buffer offset:0 atIndex:3];
+        [encoder setBytes:&seq_q length:sizeof(int) atIndex:4];
+        [encoder setBytes:&seq_k length:sizeof(int) atIndex:5];
+        [encoder setBytes:&num_heads length:sizeof(int) atIndex:6];
+        [encoder setBytes:&head_dim length:sizeof(int) atIndex:7];
+        [encoder setBytes:&scale length:sizeof(float) atIndex:8];
+
+        NSUInteger threadsPerGroup = MIN(256, (NSUInteger)seq_k);
+        [encoder dispatchThreadgroups:MTLSizeMake(seq_q, num_heads, 1)
+                threadsPerThreadgroup:MTLSizeMake(threadsPerGroup, 1, 1)];
+
+        [encoder endEncoding];
+
+        out->has_pending_work = 1;
+        Q->has_pending_work = 1;
+        K->has_pending_work = 1;
+        V->has_pending_work = 1;
+
+        if (!g_tensor_batch_mode) {
+            [cmdBuffer commit];
+            [cmdBuffer waitUntilCompleted];
+            out->has_pending_work = 0;
+            Q->has_pending_work = 0;
+            K->has_pending_work = 0;
+            V->has_pending_work = 0;
+        }
+
+        return 1;
     }
 }
 

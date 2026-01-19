@@ -190,6 +190,101 @@ kernel void silu_mul(
 }
 
 /* ========================================================================
+ * Gated Add: out += gate * proj
+ * gate: [hidden], proj: [seq, hidden], out: [seq, hidden]
+ * ======================================================================== */
+
+kernel void gated_add(
+    device float *out [[buffer(0)]],
+    device const float *gate [[buffer(1)]],
+    device const float *proj [[buffer(2)]],
+    constant int &seq [[buffer(3)]],
+    constant int &hidden [[buffer(4)]],
+    uint2 pos [[thread_position_in_grid]]  // (seq_idx, hidden_idx)
+) {
+    uint s = pos.x;
+    uint h = pos.y;
+    if (s < uint(seq) && h < uint(hidden)) {
+        uint idx = s * hidden + h;
+        out[idx] += gate[h] * proj[idx];
+    }
+}
+
+/* ========================================================================
+ * Split Fused QKV+MLP Output
+ * fused: [seq, fused_dim] where fused_dim = hidden*3 + mlp_hidden*2
+ * Splits into: q, k, v [seq, hidden], gate, up [seq, mlp_hidden]
+ * ======================================================================== */
+
+kernel void split_qkv_mlp(
+    device const float *fused [[buffer(0)]],  // [seq, fused_dim]
+    device float *q [[buffer(1)]],            // [seq, hidden]
+    device float *k [[buffer(2)]],            // [seq, hidden]
+    device float *v [[buffer(3)]],            // [seq, hidden]
+    device float *gate [[buffer(4)]],         // [seq, mlp_hidden]
+    device float *up [[buffer(5)]],           // [seq, mlp_hidden]
+    constant int &seq [[buffer(6)]],
+    constant int &hidden [[buffer(7)]],
+    constant int &mlp_hidden [[buffer(8)]],
+    uint2 pos [[thread_position_in_grid]]  // (seq_idx, element_idx within largest output)
+) {
+    uint s = pos.x;
+    uint e = pos.y;
+
+    if (s >= uint(seq)) return;
+
+    int fused_dim = hidden * 3 + mlp_hidden * 2;
+    device const float *row = fused + s * fused_dim;
+
+    // Copy Q (dims 0 to hidden-1)
+    if (e < uint(hidden)) {
+        q[s * hidden + e] = row[e];
+        k[s * hidden + e] = row[hidden + e];
+        v[s * hidden + e] = row[hidden * 2 + e];
+    }
+
+    // Copy gate and up (dims 0 to mlp_hidden-1)
+    if (e < uint(mlp_hidden)) {
+        gate[s * mlp_hidden + e] = row[hidden * 3 + e];
+        up[s * mlp_hidden + e] = row[hidden * 3 + mlp_hidden + e];
+    }
+}
+
+/* ========================================================================
+ * Concat Attention + MLP outputs for fused projection
+ * attn: [seq, hidden], mlp: [seq, mlp_hidden]
+ * out: [seq, hidden + mlp_hidden]
+ * ======================================================================== */
+
+kernel void concat_attn_mlp(
+    device const float *attn [[buffer(0)]],   // [seq, hidden]
+    device const float *mlp [[buffer(1)]],    // [seq, mlp_hidden]
+    device float *out [[buffer(2)]],          // [seq, hidden + mlp_hidden]
+    constant int &seq [[buffer(3)]],
+    constant int &hidden [[buffer(4)]],
+    constant int &mlp_hidden [[buffer(5)]],
+    uint2 pos [[thread_position_in_grid]]  // (seq_idx, element_idx)
+) {
+    uint s = pos.x;
+    uint e = pos.y;
+
+    if (s >= uint(seq)) return;
+
+    int out_dim = hidden + mlp_hidden;
+    device float *out_row = out + s * out_dim;
+
+    // Copy attention output
+    if (e < uint(hidden)) {
+        out_row[e] = attn[s * hidden + e];
+    }
+
+    // Copy MLP output
+    if (e < uint(mlp_hidden)) {
+        out_row[hidden + e] = mlp[s * mlp_hidden + e];
+    }
+}
+
+/* ========================================================================
  * Softmax (row-wise): out[i] = exp(x[i] - max) / sum(exp(x - max))
  * ======================================================================== */
 

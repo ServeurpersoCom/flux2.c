@@ -180,6 +180,17 @@ flux_gpu_tensor_t flux_gpu_linear(flux_gpu_tensor_t x,
                                    int seq_len, int in_dim, int out_dim);
 
 /*
+ * Linear layer on GPU with bf16 weights: out = x @ W^T
+ * x: [seq_len, in_dim] (f32 on GPU)
+ * W_bf16: [out_dim, in_dim] (bf16, converted to f16 internally)
+ * out: [seq_len, out_dim] (f32)
+ * Returns a new GPU tensor with the result.
+ */
+flux_gpu_tensor_t flux_gpu_linear_bf16(flux_gpu_tensor_t x,
+                                        const uint16_t *W_bf16,
+                                        int seq_len, int in_dim, int out_dim);
+
+/*
  * Sync all pending GPU operations.
  * Call this before reading tensor data or at step boundaries.
  */
@@ -219,6 +230,48 @@ void flux_gpu_chain_end(void);
  * Check if currently in chain mode.
  */
 int flux_gpu_in_chain(void);
+
+/* ========================================================================
+ * GPU Tensor Operations - Keep data on GPU between operations
+ * These functions operate on GPU tensors and keep data on GPU.
+ * Use flux_gpu_batch_begin/end to batch operations efficiently.
+ * ======================================================================== */
+
+/* AdaLN normalization on GPU: out = (1 + scale) * norm(x) + shift */
+void flux_gpu_adaln_norm(flux_gpu_tensor_t out, flux_gpu_tensor_t x,
+                         const float *shift, const float *scale,
+                         int seq, int hidden, float eps);
+
+/* QK RMSNorm on GPU: applies RMSNorm to Q and K in-place */
+void flux_gpu_qk_rms_norm(flux_gpu_tensor_t q, flux_gpu_tensor_t k,
+                          const float *q_weight, const float *k_weight,
+                          int seq, int heads, int head_dim, float eps);
+
+/* RoPE 2D on GPU: applies rotary position embeddings in-place */
+void flux_gpu_rope_2d(flux_gpu_tensor_t x, const float *cos_freq, const float *sin_freq,
+                      int seq, int heads, int head_dim, int axis_dim);
+
+/* SiLU multiply on GPU: gate = silu(gate) * up */
+void flux_gpu_silu_mul(flux_gpu_tensor_t gate, flux_gpu_tensor_t up, int n);
+
+/* Gated add on GPU: out += gate * proj */
+void flux_gpu_gated_add(flux_gpu_tensor_t out, const float *gate,
+                        flux_gpu_tensor_t proj, int seq, int hidden);
+
+/* Split fused QKV+MLP output into separate tensors */
+void flux_gpu_split_qkv_mlp(flux_gpu_tensor_t fused,
+                            flux_gpu_tensor_t q, flux_gpu_tensor_t k, flux_gpu_tensor_t v,
+                            flux_gpu_tensor_t gate, flux_gpu_tensor_t up,
+                            int seq, int hidden, int mlp_hidden);
+
+/* Concatenate attention and MLP outputs */
+void flux_gpu_concat_attn_mlp(flux_gpu_tensor_t attn, flux_gpu_tensor_t mlp,
+                              flux_gpu_tensor_t out, int seq, int hidden, int mlp_hidden);
+
+/* Fused attention on GPU tensors (no transpose needed) */
+int flux_gpu_attention_fused(flux_gpu_tensor_t out,
+                             flux_gpu_tensor_t Q, flux_gpu_tensor_t K, flux_gpu_tensor_t V,
+                             int seq_q, int seq_k, int num_heads, int head_dim, float scale);
 
 /*
  * GPU-accelerated scaled dot-product attention.

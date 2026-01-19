@@ -1163,6 +1163,193 @@ static void double_block_forward(float *img_hidden, float *txt_hidden,
  * Single-Stream Block (Parallel DiT)
  * ======================================================================== */
 
+#ifdef USE_METAL
+/* GPU-optimized single block forward using persistent GPU tensors
+ * Keeps activations on GPU throughout the block to minimize memory transfers.
+ * Returns 1 if GPU path was used, 0 to fall back to CPU path.
+ */
+static int single_block_forward_gpu(float *hidden, const single_block_t *block,
+                                    const float *t_emb, const float *adaln_weight,
+                                    const float *img_rope_cos, const float *img_rope_sin,
+                                    const float *txt_rope_cos, const float *txt_rope_sin,
+                                    int seq, int img_offset, flux_transformer_t *tf) {
+    /* Check if GPU tensors are available */
+    if (!flux_metal_available() || !flux_metal_shaders_available()) return 0;
+    if (block->qkv_mlp_weight_bf16 == NULL) return 0;  /* Need bf16 weights */
+
+    int h_size = tf->hidden_size;
+    int heads = tf->num_heads;
+    int head_dim = tf->head_dim;
+    int mlp_hidden = tf->mlp_hidden;
+    int img_seq = seq - img_offset;
+    int txt_seq = img_offset;
+    float eps = 1e-6f;
+    int axis_dim = 32;
+
+    /* === Phase 1: AdaLN modulation (small, keep on CPU) === */
+    int mod_size = h_size * 3;
+    float *t_emb_silu = tf->t_emb_silu;
+    for (int i = 0; i < h_size; i++) {
+        float x = t_emb[i];
+        t_emb_silu[i] = x / (1.0f + expf(-x));
+    }
+    float *mod_params = tf->work2 + tf->max_seq_len * h_size * 3;
+    flux_linear_nobias(mod_params, t_emb_silu, adaln_weight, 1, h_size, mod_size);
+
+    float *shift = mod_params;
+    float *scale = mod_params + h_size;
+    float *gate = mod_params + h_size * 2;
+
+    /* === Phase 2: Create GPU tensors and enter batch mode === */
+    flux_gpu_batch_begin();
+
+    /* Create input tensor on GPU */
+    flux_gpu_tensor_t hidden_gpu = flux_gpu_tensor_create(hidden, seq * h_size);
+    if (!hidden_gpu) {
+        flux_gpu_batch_end();
+        return 0;
+    }
+
+    /* Allocate output tensors */
+    flux_gpu_tensor_t norm_gpu = flux_gpu_tensor_alloc(seq * h_size);
+    int fused_dim = h_size * 3 + mlp_hidden * 2;
+    flux_gpu_tensor_t fused_gpu = flux_gpu_tensor_alloc(seq * fused_dim);
+    flux_gpu_tensor_t q_gpu = flux_gpu_tensor_alloc(seq * h_size);
+    flux_gpu_tensor_t k_gpu = flux_gpu_tensor_alloc(seq * h_size);
+    flux_gpu_tensor_t v_gpu = flux_gpu_tensor_alloc(seq * h_size);
+    flux_gpu_tensor_t gate_gpu = flux_gpu_tensor_alloc(seq * mlp_hidden);
+    flux_gpu_tensor_t up_gpu = flux_gpu_tensor_alloc(seq * mlp_hidden);
+    flux_gpu_tensor_t attn_out_gpu = flux_gpu_tensor_alloc(seq * h_size);
+    flux_gpu_tensor_t concat_gpu = flux_gpu_tensor_alloc(seq * (h_size + mlp_hidden));
+    flux_gpu_tensor_t proj_out_gpu = flux_gpu_tensor_alloc(seq * h_size);
+
+    if (!norm_gpu || !fused_gpu || !q_gpu || !k_gpu || !v_gpu ||
+        !gate_gpu || !up_gpu || !attn_out_gpu || !concat_gpu || !proj_out_gpu) {
+        /* Cleanup and fall back */
+        if (hidden_gpu) flux_gpu_tensor_free(hidden_gpu);
+        if (norm_gpu) flux_gpu_tensor_free(norm_gpu);
+        if (fused_gpu) flux_gpu_tensor_free(fused_gpu);
+        if (q_gpu) flux_gpu_tensor_free(q_gpu);
+        if (k_gpu) flux_gpu_tensor_free(k_gpu);
+        if (v_gpu) flux_gpu_tensor_free(v_gpu);
+        if (gate_gpu) flux_gpu_tensor_free(gate_gpu);
+        if (up_gpu) flux_gpu_tensor_free(up_gpu);
+        if (attn_out_gpu) flux_gpu_tensor_free(attn_out_gpu);
+        if (concat_gpu) flux_gpu_tensor_free(concat_gpu);
+        if (proj_out_gpu) flux_gpu_tensor_free(proj_out_gpu);
+        flux_gpu_batch_end();
+        return 0;
+    }
+
+    /* === Phase 3: AdaLN normalization on GPU === */
+    flux_gpu_adaln_norm(norm_gpu, hidden_gpu, shift, scale, seq, h_size, eps);
+
+    /* === Phase 4: Fused QKV + MLP projection on GPU === */
+    flux_gpu_tensor_t fused_result = flux_gpu_linear_bf16(norm_gpu,
+                                                          block->qkv_mlp_weight_bf16,
+                                                          seq, h_size, fused_dim);
+    if (!fused_result) {
+        /* Cleanup and fall back */
+        flux_gpu_tensor_free(hidden_gpu);
+        flux_gpu_tensor_free(norm_gpu);
+        flux_gpu_tensor_free(fused_gpu);
+        flux_gpu_tensor_free(q_gpu);
+        flux_gpu_tensor_free(k_gpu);
+        flux_gpu_tensor_free(v_gpu);
+        flux_gpu_tensor_free(gate_gpu);
+        flux_gpu_tensor_free(up_gpu);
+        flux_gpu_tensor_free(attn_out_gpu);
+        flux_gpu_tensor_free(concat_gpu);
+        flux_gpu_tensor_free(proj_out_gpu);
+        flux_gpu_batch_end();
+        return 0;
+    }
+
+    /* === Phase 5: Split fused output on GPU === */
+    flux_gpu_split_qkv_mlp(fused_result, q_gpu, k_gpu, v_gpu, gate_gpu, up_gpu,
+                           seq, h_size, mlp_hidden);
+
+    /* === Phase 6: QK RMSNorm on GPU === */
+    flux_gpu_qk_rms_norm(q_gpu, k_gpu, block->norm_q_weight, block->norm_k_weight,
+                         seq, heads, head_dim, eps);
+
+    /* === Phase 7: Apply RoPE - need to sync and do on CPU for text/image split === */
+    /* End batch to sync before RoPE (which needs different freqs for text vs image) */
+    flux_gpu_batch_end();
+
+    /* Read Q and K back to CPU for RoPE */
+    float *q_cpu = tf->single_q;
+    float *k_cpu = tf->single_k;
+    flux_gpu_tensor_read(q_gpu, q_cpu);
+    flux_gpu_tensor_read(k_gpu, k_cpu);
+
+    /* Apply RoPE on CPU (different frequencies for text vs image) */
+    apply_rope_2d(q_cpu, txt_rope_cos, txt_rope_sin, txt_seq, heads, head_dim, axis_dim);
+    apply_rope_2d(k_cpu, txt_rope_cos, txt_rope_sin, txt_seq, heads, head_dim, axis_dim);
+    apply_rope_2d(q_cpu + img_offset * h_size, img_rope_cos, img_rope_sin,
+                  img_seq, heads, head_dim, axis_dim);
+    apply_rope_2d(k_cpu + img_offset * h_size, img_rope_cos, img_rope_sin,
+                  img_seq, heads, head_dim, axis_dim);
+
+    /* Copy RoPE'd Q, K back to GPU tensors */
+    memcpy(flux_gpu_tensor_data(q_gpu), q_cpu, seq * h_size * sizeof(float));
+    memcpy(flux_gpu_tensor_data(k_gpu), k_cpu, seq * h_size * sizeof(float));
+
+    /* Read V to CPU for attention (our attention kernel needs all tensors fresh) */
+    float *v_cpu = tf->single_v;
+    flux_gpu_tensor_read(v_gpu, v_cpu);
+
+    /* === Phase 8: Self-attention (use existing fused kernel) === */
+    float *attn_out_cpu = tf->single_attn_out;
+    float attn_scale = 1.0f / sqrtf((float)head_dim);
+    if (!flux_metal_attention_fused(attn_out_cpu, q_cpu, k_cpu, v_cpu,
+                                    seq, seq, heads, head_dim, attn_scale)) {
+        /* Fall back to CPU attention */
+        mha_forward(attn_out_cpu, q_cpu, k_cpu, v_cpu, seq, heads, head_dim, tf);
+    }
+
+    /* === Phase 9: SwiGLU on CPU (read gate/up, apply, write back) === */
+    float *mlp_gate = tf->single_mlp_gate;
+    float *mlp_up = tf->single_mlp_up;
+    flux_gpu_tensor_read(gate_gpu, mlp_gate);
+    flux_gpu_tensor_read(up_gpu, mlp_up);
+
+    flux_silu(mlp_gate, seq * mlp_hidden);
+    flux_mul_inplace(mlp_gate, mlp_up, seq * mlp_hidden);
+
+    /* === Phase 10: Concat and final projection === */
+    float *concat_cpu = tf->single_concat;
+    for (int s = 0; s < seq; s++) {
+        memcpy(concat_cpu + s * (h_size + mlp_hidden),
+               attn_out_cpu + s * h_size, h_size * sizeof(float));
+        memcpy(concat_cpu + s * (h_size + mlp_hidden) + h_size,
+               mlp_gate + s * mlp_hidden, mlp_hidden * sizeof(float));
+    }
+
+    float *proj_out_cpu = tf->work1;
+    flux_linear_nobias_bf16(proj_out_cpu, concat_cpu, block->proj_mlp_weight_bf16,
+                            seq, h_size + mlp_hidden, h_size);
+
+    /* === Phase 11: Gated add residual === */
+    gated_add(hidden, gate, proj_out_cpu, seq, h_size);
+
+    /* === Cleanup GPU tensors === */
+    flux_gpu_tensor_free(hidden_gpu);
+    flux_gpu_tensor_free(norm_gpu);
+    flux_gpu_tensor_free(fused_result);
+    flux_gpu_tensor_free(q_gpu);
+    flux_gpu_tensor_free(k_gpu);
+    flux_gpu_tensor_free(v_gpu);
+    flux_gpu_tensor_free(gate_gpu);
+    flux_gpu_tensor_free(up_gpu);
+    flux_gpu_tensor_free(attn_out_gpu);
+    flux_gpu_tensor_free(concat_gpu);
+    flux_gpu_tensor_free(proj_out_gpu);
+
+    return 1;  /* GPU path succeeded */
+}
+#endif /* USE_METAL */
+
 static void single_block_forward(float *hidden, const single_block_t *block,
                                  const float *t_emb, const float *adaln_weight,
                                  const float *img_rope_cos, const float *img_rope_sin,
@@ -1410,11 +1597,22 @@ float *flux_transformer_forward(flux_transformer_t *tf,
     /* Single-stream blocks */
     double single_start = tf_get_time_ms();
     for (int i = 0; i < tf->num_single_layers; i++) {
-        single_block_forward(concat_hidden, &tf->single_blocks[i],
-                             t_emb, tf->adaln_single_weight,
-                             img_rope_cos, img_rope_sin,
-                             txt_rope_cos, txt_rope_sin,
-                             total_seq, txt_seq, tf);  /* txt_seq is the offset to image */
+#ifdef USE_METAL
+        /* Try GPU-optimized path first */
+        if (!single_block_forward_gpu(concat_hidden, &tf->single_blocks[i],
+                                      t_emb, tf->adaln_single_weight,
+                                      img_rope_cos, img_rope_sin,
+                                      txt_rope_cos, txt_rope_sin,
+                                      total_seq, txt_seq, tf))
+#endif
+        {
+            /* Fall back to CPU path */
+            single_block_forward(concat_hidden, &tf->single_blocks[i],
+                                 t_emb, tf->adaln_single_weight,
+                                 img_rope_cos, img_rope_sin,
+                                 txt_rope_cos, txt_rope_sin,
+                                 total_seq, txt_seq, tf);  /* txt_seq is the offset to image */
+        }
         if (flux_substep_callback)
             flux_substep_callback(FLUX_SUBSTEP_SINGLE_BLOCK, i, tf->num_single_layers);
 
