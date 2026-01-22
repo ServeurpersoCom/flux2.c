@@ -228,6 +228,14 @@ const char *flux_model_info(flux_ctx *ctx);
  */
 const char *flux_get_error(void);
 
+/*
+ * Set step image callback to receive decoded images after each denoising step.
+ * Useful for visualizing the generation process.
+ * Pass NULL to disable. The callback receives images that must NOT be freed.
+ */
+typedef void (*flux_step_image_cb_t)(int step, int total, const flux_image *img);
+void flux_set_step_image_callback(flux_ctx *ctx, flux_step_image_cb_t callback);
+
 /* ========================================================================
  * Advanced / Low-level API
  * ======================================================================== */

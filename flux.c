@@ -110,6 +110,11 @@ const char *flux_get_error(void) {
     return g_error_msg;
 }
 
+void flux_set_step_image_callback(flux_ctx *ctx, flux_step_image_cb_t callback) {
+    flux_step_image_callback = callback;
+    flux_step_image_vae = callback ? ctx->vae : NULL;
+}
+
 static void set_error(const char *msg) {
     strncpy(g_error_msg, msg, sizeof(g_error_msg) - 1);
     g_error_msg[sizeof(g_error_msg) - 1] = '\0';

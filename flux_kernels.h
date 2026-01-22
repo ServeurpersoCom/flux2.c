@@ -11,6 +11,9 @@
 #include <stddef.h>
 #include <stdint.h>
 
+/* Forward declarations */
+struct flux_image;
+
 /* ========================================================================
  * Basic Operations
  * ======================================================================== */
@@ -361,5 +364,18 @@ extern flux_step_callback_t flux_step_callback;
  */
 typedef void (*flux_phase_callback_t)(const char *phase, int done);
 extern flux_phase_callback_t flux_phase_callback;
+
+/*
+ * Step image callback - called after each denoising step with decoded image.
+ * step: current step (1-based)
+ * total: total number of steps
+ * img: decoded image at this step (caller must NOT free)
+ *
+ * To use: set both flux_step_image_callback and flux_step_image_vae before
+ * calling the sampling function. The callback is only invoked when both are set.
+ */
+typedef void (*flux_step_image_callback_t)(int step, int total, const struct flux_image *img);
+extern flux_step_image_callback_t flux_step_image_callback;
+extern void *flux_step_image_vae;  /* Set to flux_vae_t* for step image decoding */
 
 #endif /* FLUX_KERNELS_H */

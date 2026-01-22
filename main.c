@@ -137,6 +137,13 @@ static void cli_phase_callback(const char *phase, int done) {
 }
 
 /* Set up CLI progress callbacks */
+/* Step image callback - display intermediate images using Kitty protocol */
+static void cli_step_image_callback(int step, int total, const flux_image *img) {
+    (void)total;
+    fprintf(stderr, "\n[Step %d]\n", step);
+    kitty_display_image(img);
+}
+
 static void cli_setup_progress(void) {
     cli_current_step = 0;
     cli_legend_printed = 0;
@@ -214,7 +221,8 @@ static void print_usage(const char *prog) {
     fprintf(stderr, "Output options:\n");
     fprintf(stderr, "  -q, --quiet           Silent mode, no output\n");
     fprintf(stderr, "  -v, --verbose         Detailed output\n");
-    fprintf(stderr, "      --show            Display image in terminal (Kitty protocol)\n\n");
+    fprintf(stderr, "      --show            Display image in terminal (Kitty protocol)\n");
+    fprintf(stderr, "      --show-steps      Display each denoising step (slow)\n\n");
     fprintf(stderr, "Other options:\n");
     fprintf(stderr, "  -e, --embeddings PATH Load pre-computed text embeddings\n");
     fprintf(stderr, "  -m, --mmap            Use memory-mapped weights (default, fastest on MPS)\n");
@@ -259,6 +267,7 @@ int main(int argc, char *argv[]) {
         {"mmap",       no_argument,       0, 'm'},
         {"no-mmap",    no_argument,       0, 'M'},
         {"show",       no_argument,       0, 'k'},
+        {"show-steps", no_argument,       0, 'K'},
         {"debug-py",   no_argument,       0, 'D'},
         {0, 0, 0, 0}
     };
@@ -283,6 +292,7 @@ int main(int argc, char *argv[]) {
     int width_set = 0, height_set = 0;
     int use_mmap = 1;  /* mmap is default (fastest on MPS) */
     int show_image = 0;
+    int show_steps = 0;
     int debug_py = 0;
 
     int opt;
@@ -310,6 +320,7 @@ int main(int argc, char *argv[]) {
             case 'm': use_mmap = 1; break;
             case 'M': use_mmap = 0; break;
             case 'k': show_image = 1; break;
+            case 'K': show_steps = 1; break;
             case 'D': debug_py = 1; break;
             default:
                 print_usage(argv[0]);
@@ -400,6 +411,11 @@ int main(int argc, char *argv[]) {
     /* Set up progress callbacks (for normal and verbose modes) */
     if (output_level >= OUTPUT_NORMAL) {
         cli_setup_progress();
+    }
+
+    /* Set up step image callback if requested */
+    if (show_steps) {
+        flux_set_step_image_callback(ctx, cli_step_image_callback);
     }
 
     /* Generate image */
@@ -522,6 +538,11 @@ int main(int argc, char *argv[]) {
 
     /* Finish progress display */
     cli_finish_progress();
+
+    /* Clear step image callback if it was set */
+    if (show_steps) {
+        flux_set_step_image_callback(ctx, NULL);
+    }
 
     if (!output) {
         fprintf(stderr, "Error: Generation failed: %s\n", flux_get_error());

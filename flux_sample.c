@@ -169,6 +169,11 @@ extern float *flux_transformer_forward_with_refs(flux_transformer_t *tf,
                                                  const float *txt_emb, int txt_seq,
                                                  float timestep);
 
+/* VAE decode for step image callback */
+extern flux_image *flux_vae_decode(flux_vae_t *vae, const float *latent,
+                                   int batch, int latent_h, int latent_w);
+extern void flux_image_free(flux_image *img);
+
 /*
  * Sample using Euler method.
  *
@@ -240,6 +245,16 @@ float *flux_sample_euler(void *transformer, void *text_encoder,
 
         if (progress_callback) {
             progress_callback(step + 1, num_steps);
+        }
+
+        /* Step image callback - decode and display intermediate result */
+        if (flux_step_image_callback && flux_step_image_vae) {
+            flux_image *img = flux_vae_decode((flux_vae_t *)flux_step_image_vae,
+                                              z_curr, 1, h, w);
+            if (img) {
+                flux_step_image_callback(step + 1, num_steps, img);
+                flux_image_free(img);
+            }
         }
     }
 
@@ -326,6 +341,16 @@ float *flux_sample_euler_with_refs(void *transformer, void *text_encoder,
         if (progress_callback) {
             progress_callback(step + 1, num_steps);
         }
+
+        /* Step image callback - decode and display intermediate result */
+        if (flux_step_image_callback && flux_step_image_vae) {
+            flux_image *img = flux_vae_decode((flux_vae_t *)flux_step_image_vae,
+                                              z_curr, 1, h, w);
+            if (img) {
+                flux_step_image_callback(step + 1, num_steps, img);
+                flux_image_free(img);
+            }
+        }
     }
 
     /* Print timing summary */
@@ -381,6 +406,16 @@ float *flux_sample_euler_ancestral(void *transformer,
 
         if (progress_callback) {
             progress_callback(step + 1, num_steps);
+        }
+
+        /* Step image callback - decode and display intermediate result */
+        if (flux_step_image_callback && flux_step_image_vae) {
+            flux_image *img = flux_vae_decode((flux_vae_t *)flux_step_image_vae,
+                                              z_curr, 1, h, w);
+            if (img) {
+                flux_step_image_callback(step + 1, num_steps, img);
+                flux_image_free(img);
+            }
         }
     }
 
@@ -445,6 +480,16 @@ float *flux_sample_heun(void *transformer,
 
         if (progress_callback) {
             progress_callback(step + 1, num_steps);
+        }
+
+        /* Step image callback - decode and display intermediate result */
+        if (flux_step_image_callback && flux_step_image_vae) {
+            flux_image *img = flux_vae_decode((flux_vae_t *)flux_step_image_vae,
+                                              z_curr, 1, h, w);
+            if (img) {
+                flux_step_image_callback(step + 1, num_steps, img);
+                flux_image_free(img);
+            }
         }
     }
 
