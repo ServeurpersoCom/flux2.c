@@ -308,31 +308,23 @@ static int load_double_block_weights(double_block_t *b, safetensors_file_t *sf,
     snprintf(name, sizeof(name), "transformer_blocks.%d.attn.norm_k.weight", idx);
     b->img_norm_k_weight = mmap_get_f32(sf, name);
 
-    /* Image Q, K, V projections */
+    /* Image Q, K, V projections - skip f32 if bf16 available */
     snprintf(name, sizeof(name), "transformer_blocks.%d.attn.to_q.weight", idx);
-    b->img_q_weight = mmap_get_f32(sf, name);
     if (use_bf16) b->img_q_weight_bf16 = mmap_get_bf16(sf, name);
+    if (!use_bf16) b->img_q_weight = mmap_get_f32(sf, name);
     snprintf(name, sizeof(name), "transformer_blocks.%d.attn.to_k.weight", idx);
-    b->img_k_weight = mmap_get_f32(sf, name);
     if (use_bf16) b->img_k_weight_bf16 = mmap_get_bf16(sf, name);
+    if (!use_bf16) b->img_k_weight = mmap_get_f32(sf, name);
     snprintf(name, sizeof(name), "transformer_blocks.%d.attn.to_v.weight", idx);
-    b->img_v_weight = mmap_get_f32(sf, name);
     if (use_bf16) b->img_v_weight_bf16 = mmap_get_bf16(sf, name);
+    if (!use_bf16) b->img_v_weight = mmap_get_f32(sf, name);
 
     snprintf(name, sizeof(name), "transformer_blocks.%d.attn.to_out.0.weight", idx);
-    b->img_proj_weight = mmap_get_f32(sf, name);
     if (use_bf16) b->img_proj_weight_bf16 = mmap_get_bf16(sf, name);
+    if (!use_bf16) b->img_proj_weight = mmap_get_f32(sf, name);
 
-    /* Image FFN - linear_in contains gate and up fused */
+    /* Image FFN - linear_in contains gate and up fused - skip f32 if bf16 available */
     snprintf(name, sizeof(name), "transformer_blocks.%d.ff.linear_in.weight", idx);
-    float *ff_in = mmap_get_f32(sf, name);
-    if (ff_in) {
-        b->img_mlp_gate_weight = malloc(mlp * h * sizeof(float));
-        b->img_mlp_up_weight = malloc(mlp * h * sizeof(float));
-        memcpy(b->img_mlp_gate_weight, ff_in, mlp * h * sizeof(float));
-        memcpy(b->img_mlp_up_weight, ff_in + mlp * h, mlp * h * sizeof(float));
-        free(ff_in);
-    }
     if (use_bf16) {
         uint16_t *ff_in_bf16 = mmap_get_bf16(sf, name);
         if (ff_in_bf16) {
@@ -340,11 +332,20 @@ static int load_double_block_weights(double_block_t *b, safetensors_file_t *sf,
             b->img_mlp_gate_weight_bf16 = ff_in_bf16;
             b->img_mlp_up_weight_bf16 = ff_in_bf16 + (size_t)mlp * h;
         }
+    } else {
+        float *ff_in = mmap_get_f32(sf, name);
+        if (ff_in) {
+            b->img_mlp_gate_weight = malloc(mlp * h * sizeof(float));
+            b->img_mlp_up_weight = malloc(mlp * h * sizeof(float));
+            memcpy(b->img_mlp_gate_weight, ff_in, mlp * h * sizeof(float));
+            memcpy(b->img_mlp_up_weight, ff_in + mlp * h, mlp * h * sizeof(float));
+            free(ff_in);
+        }
     }
 
     snprintf(name, sizeof(name), "transformer_blocks.%d.ff.linear_out.weight", idx);
-    b->img_mlp_down_weight = mmap_get_f32(sf, name);
     if (use_bf16) b->img_mlp_down_weight_bf16 = mmap_get_bf16(sf, name);
+    if (!use_bf16) b->img_mlp_down_weight = mmap_get_f32(sf, name);
 
     /* Text stream - QK norm weights (always f32) */
     snprintf(name, sizeof(name), "transformer_blocks.%d.attn.norm_added_q.weight", idx);
@@ -352,31 +353,23 @@ static int load_double_block_weights(double_block_t *b, safetensors_file_t *sf,
     snprintf(name, sizeof(name), "transformer_blocks.%d.attn.norm_added_k.weight", idx);
     b->txt_norm_k_weight = mmap_get_f32(sf, name);
 
-    /* Text Q, K, V projections */
+    /* Text Q, K, V projections - skip f32 if bf16 available */
     snprintf(name, sizeof(name), "transformer_blocks.%d.attn.add_q_proj.weight", idx);
-    b->txt_q_weight = mmap_get_f32(sf, name);
     if (use_bf16) b->txt_q_weight_bf16 = mmap_get_bf16(sf, name);
+    if (!use_bf16) b->txt_q_weight = mmap_get_f32(sf, name);
     snprintf(name, sizeof(name), "transformer_blocks.%d.attn.add_k_proj.weight", idx);
-    b->txt_k_weight = mmap_get_f32(sf, name);
     if (use_bf16) b->txt_k_weight_bf16 = mmap_get_bf16(sf, name);
+    if (!use_bf16) b->txt_k_weight = mmap_get_f32(sf, name);
     snprintf(name, sizeof(name), "transformer_blocks.%d.attn.add_v_proj.weight", idx);
-    b->txt_v_weight = mmap_get_f32(sf, name);
     if (use_bf16) b->txt_v_weight_bf16 = mmap_get_bf16(sf, name);
+    if (!use_bf16) b->txt_v_weight = mmap_get_f32(sf, name);
 
     snprintf(name, sizeof(name), "transformer_blocks.%d.attn.to_add_out.weight", idx);
-    b->txt_proj_weight = mmap_get_f32(sf, name);
     if (use_bf16) b->txt_proj_weight_bf16 = mmap_get_bf16(sf, name);
+    if (!use_bf16) b->txt_proj_weight = mmap_get_f32(sf, name);
 
-    /* Text FFN */
+    /* Text FFN - skip f32 if bf16 available */
     snprintf(name, sizeof(name), "transformer_blocks.%d.ff_context.linear_in.weight", idx);
-    float *txt_ff_in = mmap_get_f32(sf, name);
-    if (txt_ff_in) {
-        b->txt_mlp_gate_weight = malloc(mlp * h * sizeof(float));
-        b->txt_mlp_up_weight = malloc(mlp * h * sizeof(float));
-        memcpy(b->txt_mlp_gate_weight, txt_ff_in, mlp * h * sizeof(float));
-        memcpy(b->txt_mlp_up_weight, txt_ff_in + mlp * h, mlp * h * sizeof(float));
-        free(txt_ff_in);
-    }
     if (use_bf16) {
         uint16_t *txt_ff_in_bf16 = mmap_get_bf16(sf, name);
         if (txt_ff_in_bf16) {
@@ -384,11 +377,20 @@ static int load_double_block_weights(double_block_t *b, safetensors_file_t *sf,
             b->txt_mlp_gate_weight_bf16 = txt_ff_in_bf16;
             b->txt_mlp_up_weight_bf16 = txt_ff_in_bf16 + (size_t)mlp * h;
         }
+    } else {
+        float *txt_ff_in = mmap_get_f32(sf, name);
+        if (txt_ff_in) {
+            b->txt_mlp_gate_weight = malloc(mlp * h * sizeof(float));
+            b->txt_mlp_up_weight = malloc(mlp * h * sizeof(float));
+            memcpy(b->txt_mlp_gate_weight, txt_ff_in, mlp * h * sizeof(float));
+            memcpy(b->txt_mlp_up_weight, txt_ff_in + mlp * h, mlp * h * sizeof(float));
+            free(txt_ff_in);
+        }
     }
 
     snprintf(name, sizeof(name), "transformer_blocks.%d.ff_context.linear_out.weight", idx);
-    b->txt_mlp_down_weight = mmap_get_f32(sf, name);
     if (use_bf16) b->txt_mlp_down_weight_bf16 = mmap_get_bf16(sf, name);
+    if (!use_bf16) b->txt_mlp_down_weight = mmap_get_f32(sf, name);
 
     return 0;
 }
@@ -444,15 +446,15 @@ static int load_single_block_weights(single_block_t *b, safetensors_file_t *sf,
     snprintf(name, sizeof(name), "single_transformer_blocks.%d.attn.norm_k.weight", idx);
     b->norm_k_weight = mmap_get_f32(sf, name);
 
-    /* Fused QKV+MLP input projection */
+    /* Fused QKV+MLP input projection - skip f32 if bf16 available */
     snprintf(name, sizeof(name), "single_transformer_blocks.%d.attn.to_qkv_mlp_proj.weight", idx);
-    b->qkv_mlp_weight = mmap_get_f32(sf, name);
     if (use_bf16) b->qkv_mlp_weight_bf16 = mmap_get_bf16(sf, name);
+    if (!use_bf16) b->qkv_mlp_weight = mmap_get_f32(sf, name);
 
-    /* Fused attn out + MLP down projection */
+    /* Fused attn out + MLP down projection - skip f32 if bf16 available */
     snprintf(name, sizeof(name), "single_transformer_blocks.%d.attn.to_out.weight", idx);
-    b->proj_mlp_weight = mmap_get_f32(sf, name);
     if (use_bf16) b->proj_mlp_weight_bf16 = mmap_get_bf16(sf, name);
+    if (!use_bf16) b->proj_mlp_weight = mmap_get_f32(sf, name);
 
     return 0;
 }
