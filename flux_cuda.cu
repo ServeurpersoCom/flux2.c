@@ -104,6 +104,32 @@ static void weight_cache_clear(void) {
 }
 
 /* ========================================================================
+ * Scratch Buffers - Reusable GPU memory for activations
+ * ======================================================================== */
+
+static float *g_scratch_A = NULL;
+static float *g_scratch_C = NULL;
+static size_t g_scratch_A_size = 0;
+static size_t g_scratch_C_size = 0;
+
+static float* ensure_scratch(float **buf, size_t *current, size_t needed) {
+    if (*current >= needed) return *buf;
+    if (*buf) cudaFree(*buf);
+    if (cudaMalloc((void**)buf, needed) != cudaSuccess) {
+        *buf = NULL;
+        *current = 0;
+        return NULL;
+    }
+    *current = needed;
+    return *buf;
+}
+
+static void free_scratch(void) {
+    if (g_scratch_A) { cudaFree(g_scratch_A); g_scratch_A = NULL; g_scratch_A_size = 0; }
+    if (g_scratch_C) { cudaFree(g_scratch_C); g_scratch_C = NULL; g_scratch_C_size = 0; }
+}
+
+/* ========================================================================
  * Kernel Constants
  * ======================================================================== */
 
@@ -154,6 +180,7 @@ int flux_cuda_kernels_available(void) { return g_available; }
 
 void flux_cuda_cleanup(void) {
     weight_cache_clear();
+    free_scratch();
     if (g_stream) { cudaStreamDestroy(g_stream); g_stream = NULL; }
     if (g_cublas) { cublasDestroy(g_cublas); g_cublas = NULL; }
     g_available = 0;
@@ -389,29 +416,21 @@ void flux_cuda_sgemm(int ta, int tb, int M, int N, int K,
     size_t szB = (size_t)(tb ? N * K : K * N) * sizeof(float);
     size_t szC = (size_t)M * N * sizeof(float);
 
-    float *dA, *dB, *dC;
-
-    /* A = activations, always upload fresh */
-    CUDA_CHECK(cudaMalloc(&dA, szA));
+    /* A = activations, use scratch buffer */
+    float *dA = ensure_scratch(&g_scratch_A, &g_scratch_A_size, szA);
+    if (!dA) return;
     CUDA_CHECK(cudaMemcpyAsync(dA, A, szA, cudaMemcpyHostToDevice, g_stream));
 
     /* B = weights, check cache first */
-    dB = (float*)weight_cache_get(B);
-    int B_cached = (dB != NULL);
-    if (!B_cached) {
-        /* Try to cache it */
+    float *dB = (float*)weight_cache_get(B);
+    if (!dB) {
         dB = (float*)weight_cache_add(B, szB);
-        if (dB) {
-            B_cached = 1;
-        } else {
-            /* Cache full, upload temporarily */
-            CUDA_CHECK(cudaMalloc(&dB, szB));
-            CUDA_CHECK(cudaMemcpyAsync(dB, B, szB, cudaMemcpyHostToDevice, g_stream));
-        }
+        if (!dB) return;  /* Cache full and can't allocate */
     }
 
-    /* C = output */
-    CUDA_CHECK(cudaMalloc(&dC, szC));
+    /* C = output, use scratch buffer */
+    float *dC = ensure_scratch(&g_scratch_C, &g_scratch_C_size, szC);
+    if (!dC) return;
     if (beta != 0.0f) CUDA_CHECK(cudaMemcpyAsync(dC, C, szC, cudaMemcpyHostToDevice, g_stream));
 
     cublasOperation_t opA = ta ? CUBLAS_OP_T : CUBLAS_OP_N;
@@ -422,11 +441,6 @@ void flux_cuda_sgemm(int ta, int tb, int M, int N, int K,
 
     CUDA_CHECK(cudaMemcpyAsync(C, dC, szC, cudaMemcpyDeviceToHost, g_stream));
     if (!g_batch_mode) cudaStreamSynchronize(g_stream);
-
-    /* Free A and C, keep B if cached */
-    cudaFree(dA);
-    if (!B_cached) cudaFree(dB);
-    cudaFree(dC);
 }
 
 void flux_cuda_sgemm_bf16(int ta, int tb, int M, int N, int K,
