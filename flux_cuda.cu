@@ -350,30 +350,16 @@ void flux_cuda_sgemm(int ta, int tb, int M, int N, int K,
     /*
      * Row-major to column-major trick for cuBLAS:
      * We want: C[M,N] = A[M,K] @ B[K,N] (row-major)
-     * cuBLAS computes: C[N,M] = B[N,K] @ A[K,M] (column-major view)
-     * Which is equivalent to: C^T = B^T @ A^T
-     *
-     * For row-major A[M,K] with lda=K, cuBLAS sees it as column-major A^T[K,M]
-     * For row-major B[K,N] with ldb=N, cuBLAS sees it as column-major B^T[N,K]
-     * For row-major C[M,N] with ldc=N, cuBLAS sees it as column-major C^T[N,M]
+     * cuBLAS sees row-major data as transposed column-major.
      *
      * So we call: cublasSgemm(op_B, op_A, N, M, K, alpha, B, ldb, A, lda, beta, C, ldc)
-     * With transpositions inverted because of the row/col flip.
+     * This computes C^T = B^T @ A^T which gives us C in row-major.
      */
     cublasOperation_t opA = ta ? CUBLAS_OP_T : CUBLAS_OP_N;
     cublasOperation_t opB = tb ? CUBLAS_OP_T : CUBLAS_OP_N;
 
-    /* Leading dimensions for cuBLAS (column-major view):
-     * - B viewed as column-major: ldB = N (if not transposed) or K (if transposed in row-major)
-     * - A viewed as column-major: ldA = K (if not transposed) or M (if transposed in row-major)
-     * - C viewed as column-major: ldC = N
-     */
-    int ldA_cublas = ta ? M : K;  /* A is [M,K] or [K,M]^T in row-major */
-    int ldB_cublas = tb ? K : N;  /* B is [K,N] or [N,K]^T in row-major */
-    int ldC_cublas = N;           /* C is [M,N] in row-major = [N,M] in col-major */
-
     CUBLAS_CHECK(cublasSgemm(g_cublas, opB, opA, N, M, K, &alpha,
-                             dB, ldB_cublas, dA, ldA_cublas, &beta, dC, ldC_cublas));
+                             dB, ldb, dA, lda, &beta, dC, ldc));
 
     CUDA_CHECK(cudaMemcpyAsync(C, dC, szC, cudaMemcpyDeviceToHost, g_stream));
     if (!g_batch_mode) cudaStreamSynchronize(g_stream);
