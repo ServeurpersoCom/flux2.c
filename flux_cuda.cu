@@ -394,21 +394,29 @@ void flux_cuda_sgemm_batch(int ta, int tb, int M, int N, int K,
  * C API Wrappers for Kernels
  * ======================================================================== */
 
-#define KERNEL_1D(name, call) \
-void flux_cuda_##name(float *x, int n) { \
-    if (!g_available) return; \
-    float *dx; size_t sz = n * sizeof(float); \
-    CUDA_CHECK(cudaMalloc(&dx, sz)); \
-    CUDA_CHECK(cudaMemcpyAsync(dx, x, sz, cudaMemcpyHostToDevice, g_stream)); \
-    int blk = (n + BLOCK_1D - 1) / BLOCK_1D; \
-    call; \
-    CUDA_CHECK(cudaMemcpyAsync(x, dx, sz, cudaMemcpyDeviceToHost, g_stream)); \
-    if (!g_batch_mode) cudaStreamSynchronize(g_stream); \
-    cudaFree(dx); \
+void flux_cuda_silu(float *x, int n) {
+    if (!g_available) return;
+    float *dx; size_t sz = n * sizeof(float);
+    CUDA_CHECK(cudaMalloc(&dx, sz));
+    CUDA_CHECK(cudaMemcpyAsync(dx, x, sz, cudaMemcpyHostToDevice, g_stream));
+    int blk = (n + BLOCK_1D - 1) / BLOCK_1D;
+    k_silu<<<blk, BLOCK_1D, 0, g_stream>>>(dx, n);
+    CUDA_CHECK(cudaMemcpyAsync(x, dx, sz, cudaMemcpyDeviceToHost, g_stream));
+    if (!g_batch_mode) cudaStreamSynchronize(g_stream);
+    cudaFree(dx);
 }
 
-KERNEL_1D(silu, k_silu<<<blk, BLOCK_1D, 0, g_stream>>>(dx, n))
-KERNEL_1D(gelu, k_gelu<<<blk, BLOCK_1D, 0, g_stream>>>(dx, n))
+void flux_cuda_gelu(float *x, int n) {
+    if (!g_available) return;
+    float *dx; size_t sz = n * sizeof(float);
+    CUDA_CHECK(cudaMalloc(&dx, sz));
+    CUDA_CHECK(cudaMemcpyAsync(dx, x, sz, cudaMemcpyHostToDevice, g_stream));
+    int blk = (n + BLOCK_1D - 1) / BLOCK_1D;
+    k_gelu<<<blk, BLOCK_1D, 0, g_stream>>>(dx, n);
+    CUDA_CHECK(cudaMemcpyAsync(x, dx, sz, cudaMemcpyDeviceToHost, g_stream));
+    if (!g_batch_mode) cudaStreamSynchronize(g_stream);
+    cudaFree(dx);
+}
 
 void flux_cuda_silu_mul(float *gate, const float *up, int n) {
     if (!g_available) return;
