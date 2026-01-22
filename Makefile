@@ -120,7 +120,7 @@ CUDA_AVAILABLE := $(shell which $(NVCC) 2>/dev/null)
 ifdef CUDA_AVAILABLE
 CUDA_CFLAGS = $(CFLAGS_BASE) -DUSE_CUDA -DUSE_BLAS -I$(CUDA_PATH)/include
 CUDA_NVCCFLAGS = -O3 -use_fast_math --compiler-options "$(CFLAGS_BASE)"
-CUDA_LDFLAGS = $(LDFLAGS) -L$(CUDA_PATH)/lib64 -lcudart -lcublas -lopenblas
+CUDA_LDFLAGS = $(LDFLAGS) -L$(CUDA_PATH)/lib64 -lcudart -lcublas -lopenblas -lstdc++
 
 # Auto-detect GPU architecture (default to common ones if detection fails)
 CUDA_ARCH ?= $(shell $(NVCC) --list-gpu-arch 2>/dev/null | tail -1 || echo "sm_75")
