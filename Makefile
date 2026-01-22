@@ -19,7 +19,7 @@ LIB = libflux.a
 # Debug build flags
 DEBUG_CFLAGS = -Wall -Wextra -g -O0 -DDEBUG -fsanitize=address
 
-.PHONY: all clean debug lib install info test pngtest help generic blas mps
+.PHONY: all clean debug lib install info test pngtest help generic blas mps cuda
 
 # Default: show available targets
 all: help
@@ -34,6 +34,8 @@ ifeq ($(UNAME_S),Darwin)
 ifeq ($(UNAME_M),arm64)
 	@echo "  make mps      - Apple Silicon with Metal GPU (fastest)"
 endif
+else
+	@echo "  make cuda     - NVIDIA GPU with CUDA/cuBLAS (fastest)"
 endif
 	@echo ""
 	@echo "Other targets:"
@@ -43,7 +45,11 @@ endif
 	@echo "  make info     - Show build configuration"
 	@echo "  make lib      - Build static library"
 	@echo ""
+ifeq ($(UNAME_S),Darwin)
 	@echo "Example: make mps && ./flux -d flux-klein-model -p \"a cat\" -o cat.png"
+else
+	@echo "Example: make cuda && ./flux -d flux-klein-model -p \"a cat\" -o cat.png"
+endif
 
 # =============================================================================
 # Backend: generic (pure C, no BLAS)
@@ -102,6 +108,47 @@ mps:
 endif
 
 # =============================================================================
+# Backend: cuda (NVIDIA GPU with CUDA/cuBLAS)
+# =============================================================================
+# CUDA Toolkit paths - adjust if needed
+CUDA_PATH ?= /usr/local/cuda
+NVCC = $(CUDA_PATH)/bin/nvcc
+
+# Detect CUDA availability
+CUDA_AVAILABLE := $(shell which $(NVCC) 2>/dev/null)
+
+ifdef CUDA_AVAILABLE
+CUDA_CFLAGS = $(CFLAGS_BASE) -DUSE_CUDA -DUSE_BLAS -I$(CUDA_PATH)/include
+CUDA_NVCCFLAGS = -O3 -use_fast_math --compiler-options "$(CFLAGS_BASE)"
+CUDA_LDFLAGS = $(LDFLAGS) -L$(CUDA_PATH)/lib64 -lcudart -lcublas -lopenblas
+
+# Auto-detect GPU architecture (default to common ones if detection fails)
+CUDA_ARCH ?= $(shell $(NVCC) --list-gpu-arch 2>/dev/null | tail -1 || echo "sm_75")
+CUDA_NVCCFLAGS += -arch=$(CUDA_ARCH)
+
+cuda: clean cuda-build
+	@echo ""
+	@echo "Built with CUDA backend (NVIDIA GPU acceleration)"
+	@echo "Using GPU architecture: $(CUDA_ARCH)"
+
+cuda-build: $(SRCS:.c=.cuda.o) flux_cuda.o main.cuda.o
+	$(CC) $(CUDA_CFLAGS) -o $(TARGET) $^ $(CUDA_LDFLAGS)
+
+%.cuda.o: %.c flux.h flux_kernels.h
+	$(CC) $(CUDA_CFLAGS) -c -o $@ $<
+
+flux_cuda.o: flux_cuda.cu flux_cuda.h
+	$(NVCC) $(CUDA_NVCCFLAGS) -c -o $@ $<
+
+else
+cuda:
+	@echo "Error: CUDA toolkit not found"
+	@echo "Please install CUDA toolkit and ensure nvcc is in PATH"
+	@echo "Or set CUDA_PATH environment variable"
+	@exit 1
+endif
+
+# =============================================================================
 # Build rules
 # =============================================================================
 $(TARGET): $(OBJS) main.o
@@ -147,7 +194,7 @@ install: $(TARGET) $(LIB)
 	install -m 644 flux_kernels.h /usr/local/include/
 
 clean:
-	rm -f $(OBJS) *.mps.o flux_metal.o main.o $(TARGET) $(LIB)
+	rm -f $(OBJS) *.mps.o *.cuda.o flux_metal.o flux_cuda.o main.o $(TARGET) $(LIB)
 
 info:
 	@echo "Platform: $(UNAME_S) $(UNAME_M)"
@@ -162,13 +209,16 @@ ifeq ($(UNAME_M),arm64)
 endif
 else
 	@echo "  blas    - OpenBLAS (requires libopenblas-dev)"
+ifdef CUDA_AVAILABLE
+	@echo "  cuda    - NVIDIA GPU (requires CUDA toolkit)"
+endif
 endif
 
 # =============================================================================
 # Dependencies
 # =============================================================================
 flux.o: flux.c flux.h flux_kernels.h flux_safetensors.h flux_qwen3.h
-flux_kernels.o: flux_kernels.c flux_kernels.h
+flux_kernels.o: flux_kernels.c flux_kernels.h flux_cuda.h
 flux_tokenizer.o: flux_tokenizer.c flux.h
 flux_vae.o: flux_vae.c flux.h flux_kernels.h
 flux_transformer.o: flux_transformer.c flux.h flux_kernels.h
@@ -177,4 +227,5 @@ flux_image.o: flux_image.c flux.h
 flux_safetensors.o: flux_safetensors.c flux_safetensors.h
 flux_qwen3.o: flux_qwen3.c flux_qwen3.h flux_safetensors.h
 flux_qwen3_tokenizer.o: flux_qwen3_tokenizer.c flux_qwen3.h
+flux_cuda.o: flux_cuda.cu flux_cuda.h
 main.o: main.c flux.h flux_kernels.h
