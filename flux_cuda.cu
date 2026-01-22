@@ -68,31 +68,31 @@ static int g_compute_cap = 0;
 int flux_cuda_init(void) {
     if (g_initialized) return g_available;
     g_initialized = 1;
-    
+
     int count = 0;
     if (cudaGetDeviceCount(&count) != cudaSuccess || count == 0) {
         fprintf(stderr, "CUDA: No devices found\n");
         return 0;
     }
-    
+
     cudaDeviceProp prop;
     if (cudaGetDeviceProperties(&prop, 0) != cudaSuccess) return 0;
-    
+
     snprintf(g_device_name, sizeof(g_device_name), "%s", prop.name);
     g_compute_cap = prop.major * 10 + prop.minor;
-    
+
     printf("CUDA: %s (SM %d.%d, %zu MB)\n", prop.name, prop.major, prop.minor,
            prop.totalGlobalMem / (1024 * 1024));
-    
+
     if (cublasCreate(&g_cublas) != CUBLAS_STATUS_SUCCESS) return 0;
     if (cudaStreamCreate(&g_stream) != cudaSuccess) {
         cublasDestroy(g_cublas);
         return 0;
     }
-    
+
     cublasSetStream(g_cublas, g_stream);
     if (g_compute_cap >= 70) cublasSetMathMode(g_cublas, CUBLAS_TF32_TENSOR_OP_MATH);
-    
+
     g_available = 1;
     return 1;
 }
@@ -170,10 +170,10 @@ __global__ void k_rms_norm(float *out, const float *x, const float *w,
                             int seq, int hid, float eps) {
     int row = blockIdx.x;
     if (row >= seq) return;
-    
+
     const float *xr = x + row * hid;
     float *outr = out + row * hid;
-    
+
     __shared__ float ssum[BLOCK_NORM];
     float sum = 0.0f;
     for (int i = threadIdx.x; i < hid; i += blockDim.x) {
@@ -182,12 +182,12 @@ __global__ void k_rms_norm(float *out, const float *x, const float *w,
     }
     ssum[threadIdx.x] = sum;
     __syncthreads();
-    
+
     for (int s = blockDim.x / 2; s > 0; s >>= 1) {
         if (threadIdx.x < s) ssum[threadIdx.x] += ssum[threadIdx.x + s];
         __syncthreads();
     }
-    
+
     float rms = rsqrtf(ssum[0] / hid + eps);
     for (int i = threadIdx.x; i < hid; i += blockDim.x) {
         outr[i] = xr[i] * rms * w[i];
@@ -197,22 +197,22 @@ __global__ void k_rms_norm(float *out, const float *x, const float *w,
 __global__ void k_softmax(float *x, int rows, int cols) {
     int row = blockIdx.x;
     if (row >= rows) return;
-    
+
     float *xr = x + row * cols;
     __shared__ float smax[BLOCK_NORM], ssum[BLOCK_NORM];
-    
+
     float mx = -INFINITY;
     for (int i = threadIdx.x; i < cols; i += blockDim.x)
         mx = fmaxf(mx, xr[i]);
     smax[threadIdx.x] = mx;
     __syncthreads();
-    
+
     for (int s = blockDim.x / 2; s > 0; s >>= 1) {
         if (threadIdx.x < s) smax[threadIdx.x] = fmaxf(smax[threadIdx.x], smax[threadIdx.x + s]);
         __syncthreads();
     }
     mx = smax[0];
-    
+
     float sm = 0.0f;
     for (int i = threadIdx.x; i < cols; i += blockDim.x) {
         float e = expf(xr[i] - mx);
@@ -221,13 +221,13 @@ __global__ void k_softmax(float *x, int rows, int cols) {
     }
     ssum[threadIdx.x] = sm;
     __syncthreads();
-    
+
     for (int s = blockDim.x / 2; s > 0; s >>= 1) {
         if (threadIdx.x < s) ssum[threadIdx.x] += ssum[threadIdx.x + s];
         __syncthreads();
     }
     sm = ssum[0];
-    
+
     for (int i = threadIdx.x; i < cols; i += blockDim.x)
         xr[i] /= sm;
 }
@@ -237,10 +237,10 @@ __global__ void k_qk_rms_norm(float *q, float *k, const float *qw, const float *
     int idx = blockIdx.x;
     int s = idx / heads, h = idx % heads;
     if (s >= seq) return;
-    
+
     float *qh = q + s * heads * hdim + h * hdim;
     float *kh = k + s * heads * hdim + h * hdim;
-    
+
     __shared__ float sq[BLOCK_NORM], sk[BLOCK_NORM];
     float sumq = 0, sumk = 0;
     for (int i = threadIdx.x; i < hdim; i += blockDim.x) {
@@ -250,7 +250,7 @@ __global__ void k_qk_rms_norm(float *q, float *k, const float *qw, const float *
     sq[threadIdx.x] = sumq;
     sk[threadIdx.x] = sumk;
     __syncthreads();
-    
+
     for (int st = blockDim.x / 2; st > 0; st >>= 1) {
         if (threadIdx.x < st) {
             sq[threadIdx.x] += sq[threadIdx.x + st];
@@ -258,10 +258,10 @@ __global__ void k_qk_rms_norm(float *q, float *k, const float *qw, const float *
         }
         __syncthreads();
     }
-    
+
     float rmsq = rsqrtf(sq[0] / hdim + eps);
     float rmsk = rsqrtf(sk[0] / hdim + eps);
-    
+
     for (int i = threadIdx.x; i < hdim; i += blockDim.x) {
         qh[i] = qh[i] * rmsq * qw[i];
         kh[i] = kh[i] * rmsk * kw[i];
@@ -272,10 +272,10 @@ __global__ void k_adaln_norm(float *out, const float *x, const float *shift,
                               const float *scale, int seq, int hid, float eps) {
     int row = blockIdx.x;
     if (row >= seq) return;
-    
+
     const float *xr = x + row * hid;
     float *outr = out + row * hid;
-    
+
     __shared__ float smean[BLOCK_NORM], svar[BLOCK_NORM];
     float sm = 0, sv = 0;
     for (int i = threadIdx.x; i < hid; i += blockDim.x) sm += xr[i];
@@ -286,7 +286,7 @@ __global__ void k_adaln_norm(float *out, const float *x, const float *shift,
         __syncthreads();
     }
     float mean = smean[0] / hid;
-    
+
     for (int i = threadIdx.x; i < hid; i += blockDim.x) {
         float d = xr[i] - mean;
         sv += d * d;
@@ -298,7 +298,7 @@ __global__ void k_adaln_norm(float *out, const float *x, const float *shift,
         __syncthreads();
     }
     float rstd = rsqrtf(svar[0] / hid + eps);
-    
+
     for (int i = threadIdx.x; i < hid; i += blockDim.x) {
         float norm = (xr[i] - mean) * rstd;
         outr[i] = (1.0f + scale[i]) * norm + shift[i];
@@ -310,15 +310,15 @@ __global__ void k_rope_2d(float *x, const float *cos_f, const float *sin_f,
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     int total = seq * heads * (axis_dim / 2);
     if (idx >= total) return;
-    
+
     int s = idx / (heads * (axis_dim / 2));
     int rem = idx % (heads * (axis_dim / 2));
     int h = rem / (axis_dim / 2);
     int p = rem % (axis_dim / 2);
-    
+
     int freq_idx = s * (axis_dim / 2) + p;
     float c = cos_f[freq_idx], sn = sin_f[freq_idx];
-    
+
     int base = s * heads * hdim + h * hdim + p * 2;
     float x0 = x[base], x1 = x[base + 1];
     x[base] = x0 * c - x1 * sn;
@@ -333,29 +333,51 @@ void flux_cuda_sgemm(int ta, int tb, int M, int N, int K,
                      float alpha, const float *A, int lda,
                      const float *B, int ldb, float beta, float *C, int ldc) {
     if (!g_available) return;
-    
+
     size_t szA = (size_t)(ta ? K * M : M * K) * sizeof(float);
     size_t szB = (size_t)(tb ? N * K : K * N) * sizeof(float);
     size_t szC = (size_t)M * N * sizeof(float);
-    
+
     float *dA, *dB, *dC;
     CUDA_CHECK(cudaMalloc(&dA, szA));
     CUDA_CHECK(cudaMalloc(&dB, szB));
     CUDA_CHECK(cudaMalloc(&dC, szC));
-    
+
     CUDA_CHECK(cudaMemcpyAsync(dA, A, szA, cudaMemcpyHostToDevice, g_stream));
     CUDA_CHECK(cudaMemcpyAsync(dB, B, szB, cudaMemcpyHostToDevice, g_stream));
     if (beta != 0.0f) CUDA_CHECK(cudaMemcpyAsync(dC, C, szC, cudaMemcpyHostToDevice, g_stream));
-    
-    /* Row-major trick: C = A @ B -> C^T = B^T @ A^T */
-    cublasOperation_t opA = ta ? CUBLAS_OP_N : CUBLAS_OP_T;
-    cublasOperation_t opB = tb ? CUBLAS_OP_N : CUBLAS_OP_T;
-    
-    CUBLAS_CHECK(cublasSgemm(g_cublas, opB, opA, N, M, K, &alpha, dB, ldb, dA, lda, &beta, dC, ldc));
-    
+
+    /*
+     * Row-major to column-major trick for cuBLAS:
+     * We want: C[M,N] = A[M,K] @ B[K,N] (row-major)
+     * cuBLAS computes: C[N,M] = B[N,K] @ A[K,M] (column-major view)
+     * Which is equivalent to: C^T = B^T @ A^T
+     *
+     * For row-major A[M,K] with lda=K, cuBLAS sees it as column-major A^T[K,M]
+     * For row-major B[K,N] with ldb=N, cuBLAS sees it as column-major B^T[N,K]
+     * For row-major C[M,N] with ldc=N, cuBLAS sees it as column-major C^T[N,M]
+     *
+     * So we call: cublasSgemm(op_B, op_A, N, M, K, alpha, B, ldb, A, lda, beta, C, ldc)
+     * With transpositions inverted because of the row/col flip.
+     */
+    cublasOperation_t opA = ta ? CUBLAS_OP_T : CUBLAS_OP_N;
+    cublasOperation_t opB = tb ? CUBLAS_OP_T : CUBLAS_OP_N;
+
+    /* Leading dimensions for cuBLAS (column-major view):
+     * - B viewed as column-major: ldB = N (if not transposed) or K (if transposed in row-major)
+     * - A viewed as column-major: ldA = K (if not transposed) or M (if transposed in row-major)
+     * - C viewed as column-major: ldC = N
+     */
+    int ldA_cublas = ta ? M : K;  /* A is [M,K] or [K,M]^T in row-major */
+    int ldB_cublas = tb ? K : N;  /* B is [K,N] or [N,K]^T in row-major */
+    int ldC_cublas = N;           /* C is [M,N] in row-major = [N,M] in col-major */
+
+    CUBLAS_CHECK(cublasSgemm(g_cublas, opB, opA, N, M, K, &alpha,
+                             dB, ldB_cublas, dA, ldA_cublas, &beta, dC, ldC_cublas));
+
     CUDA_CHECK(cudaMemcpyAsync(C, dC, szC, cudaMemcpyDeviceToHost, g_stream));
     if (!g_batch_mode) cudaStreamSynchronize(g_stream);
-    
+
     cudaFree(dA); cudaFree(dB); cudaFree(dC);
 }
 
@@ -364,17 +386,17 @@ void flux_cuda_sgemm_bf16(int ta, int tb, int M, int N, int K,
                           const uint16_t *B_bf16, int ldb,
                           float beta, float *C, int ldc) {
     if (!g_available) return;
-    
+
     /* Convert bf16 to f32 */
     size_t szB = (size_t)(tb ? N * K : K * N);
     float *B_f32 = (float *)malloc(szB * sizeof(float));
     if (!B_f32) return;
-    
+
     for (size_t i = 0; i < szB; i++) {
         uint32_t bits = ((uint32_t)B_bf16[i]) << 16;
         memcpy(&B_f32[i], &bits, sizeof(float));
     }
-    
+
     flux_cuda_sgemm(ta, tb, M, N, K, alpha, A, lda, B_f32, ldb, beta, C, ldc);
     free(B_f32);
 }
