@@ -54,6 +54,56 @@ static char g_device_name[256] = "Unknown";
 static int g_compute_cap = 0;
 
 /* ========================================================================
+ * Weight Cache - Keep weights on GPU permanently
+ * ======================================================================== */
+
+#define WEIGHT_CACHE_SIZE 2048
+
+typedef struct {
+    const void *cpu_ptr;  /* Key: CPU address of weight */
+    void *gpu_ptr;        /* Value: GPU copy */
+    size_t size;
+} weight_cache_entry_t;
+
+static weight_cache_entry_t g_weight_cache[WEIGHT_CACHE_SIZE];
+static int g_weight_cache_count = 0;
+
+static void* weight_cache_get(const void *cpu_ptr) {
+    for (int i = 0; i < g_weight_cache_count; i++) {
+        if (g_weight_cache[i].cpu_ptr == cpu_ptr) {
+            return g_weight_cache[i].gpu_ptr;
+        }
+    }
+    return NULL;
+}
+
+static void* weight_cache_add(const void *cpu_ptr, size_t size) {
+    if (g_weight_cache_count >= WEIGHT_CACHE_SIZE) return NULL;
+
+    void *gpu_ptr = NULL;
+    if (cudaMalloc(&gpu_ptr, size) != cudaSuccess) return NULL;
+    if (cudaMemcpy(gpu_ptr, cpu_ptr, size, cudaMemcpyHostToDevice) != cudaSuccess) {
+        cudaFree(gpu_ptr);
+        return NULL;
+    }
+
+    g_weight_cache[g_weight_cache_count].cpu_ptr = cpu_ptr;
+    g_weight_cache[g_weight_cache_count].gpu_ptr = gpu_ptr;
+    g_weight_cache[g_weight_cache_count].size = size;
+    g_weight_cache_count++;
+
+    return gpu_ptr;
+}
+
+static void weight_cache_clear(void) {
+    for (int i = 0; i < g_weight_cache_count; i++) {
+        if (g_weight_cache[i].gpu_ptr) cudaFree(g_weight_cache[i].gpu_ptr);
+    }
+    g_weight_cache_count = 0;
+    memset(g_weight_cache, 0, sizeof(g_weight_cache));
+}
+
+/* ========================================================================
  * Kernel Constants
  * ======================================================================== */
 
@@ -103,6 +153,7 @@ int flux_cuda_compute_capability(void) { return g_compute_cap; }
 int flux_cuda_kernels_available(void) { return g_available; }
 
 void flux_cuda_cleanup(void) {
+    weight_cache_clear();
     if (g_stream) { cudaStreamDestroy(g_stream); g_stream = NULL; }
     if (g_cublas) { cublasDestroy(g_cublas); g_cublas = NULL; }
     g_available = 0;
@@ -339,22 +390,30 @@ void flux_cuda_sgemm(int ta, int tb, int M, int N, int K,
     size_t szC = (size_t)M * N * sizeof(float);
 
     float *dA, *dB, *dC;
-    CUDA_CHECK(cudaMalloc(&dA, szA));
-    CUDA_CHECK(cudaMalloc(&dB, szB));
-    CUDA_CHECK(cudaMalloc(&dC, szC));
 
+    /* A = activations, always upload fresh */
+    CUDA_CHECK(cudaMalloc(&dA, szA));
     CUDA_CHECK(cudaMemcpyAsync(dA, A, szA, cudaMemcpyHostToDevice, g_stream));
-    CUDA_CHECK(cudaMemcpyAsync(dB, B, szB, cudaMemcpyHostToDevice, g_stream));
+
+    /* B = weights, check cache first */
+    dB = (float*)weight_cache_get(B);
+    int B_cached = (dB != NULL);
+    if (!B_cached) {
+        /* Try to cache it */
+        dB = (float*)weight_cache_add(B, szB);
+        if (dB) {
+            B_cached = 1;
+        } else {
+            /* Cache full, upload temporarily */
+            CUDA_CHECK(cudaMalloc(&dB, szB));
+            CUDA_CHECK(cudaMemcpyAsync(dB, B, szB, cudaMemcpyHostToDevice, g_stream));
+        }
+    }
+
+    /* C = output */
+    CUDA_CHECK(cudaMalloc(&dC, szC));
     if (beta != 0.0f) CUDA_CHECK(cudaMemcpyAsync(dC, C, szC, cudaMemcpyHostToDevice, g_stream));
 
-    /*
-     * Row-major to column-major trick for cuBLAS:
-     * We want: C[M,N] = A[M,K] @ B[K,N] (row-major)
-     * cuBLAS sees row-major data as transposed column-major.
-     *
-     * So we call: cublasSgemm(op_B, op_A, N, M, K, alpha, B, ldb, A, lda, beta, C, ldc)
-     * This computes C^T = B^T @ A^T which gives us C in row-major.
-     */
     cublasOperation_t opA = ta ? CUBLAS_OP_T : CUBLAS_OP_N;
     cublasOperation_t opB = tb ? CUBLAS_OP_T : CUBLAS_OP_N;
 
@@ -364,7 +423,10 @@ void flux_cuda_sgemm(int ta, int tb, int M, int N, int K,
     CUDA_CHECK(cudaMemcpyAsync(C, dC, szC, cudaMemcpyDeviceToHost, g_stream));
     if (!g_batch_mode) cudaStreamSynchronize(g_stream);
 
-    cudaFree(dA); cudaFree(dB); cudaFree(dC);
+    /* Free A and C, keep B if cached */
+    cudaFree(dA);
+    if (!B_cached) cudaFree(dB);
+    cudaFree(dC);
 }
 
 void flux_cuda_sgemm_bf16(int ta, int tb, int M, int N, int K,
