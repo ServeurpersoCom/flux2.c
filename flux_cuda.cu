@@ -1009,17 +1009,17 @@ void flux_cuda_rope_offset_t(int x_id, const float *cos_f, const float *sin_f,
 __global__ void k_im2col(float *col, const float *in,
                          int in_ch, int H, int W,
                          int kH, int kW, int outH, int outW,
-                         int stride, int padding) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    int total = in_ch * kH * kW * outH * outW;
+                         int stride, int padding, size_t total) {
+    size_t idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= total) return;
 
     /* Decode index: col is [in_ch*kH*kW, outH*outW] */
+    size_t spatial = (size_t)outH * outW;
     int ow = idx % outW;
     int oh = (idx / outW) % outH;
-    int kw = (idx / (outW * outH)) % kW;
-    int kh = (idx / (outW * outH * kW)) % kH;
-    int ic = idx / (outW * outH * kW * kH);
+    int kw = (idx / spatial) % kW;
+    int kh = (idx / spatial / kW) % kH;
+    int ic = idx / spatial / kW / kH;
 
     int ih = oh * stride - padding + kh;
     int iw = ow * stride - padding + kw;
@@ -1031,8 +1031,8 @@ __global__ void k_im2col(float *col, const float *in,
 
     /* col layout: [in_ch*kH*kW, outH*outW] row-major */
     int col_row = ic * kH * kW + kh * kW + kw;
-    int col_col = oh * outW + ow;
-    col[col_row * (outH * outW) + col_col] = val;
+    size_t col_col = (size_t)oh * outW + ow;
+    col[(size_t)col_row * spatial + col_col] = val;
 }
 
 /* Add bias kernel */
@@ -1085,10 +1085,11 @@ int flux_cuda_conv2d(float *out, const float *in, const float *weight, const flo
         /* Upload input */
         cudaMemcpy(d_in, in_b, sz_in, cudaMemcpyHostToDevice);
 
-        /* im2col */
-        int total_col = in_ch * kH * kW * outH * outW;
-        k_im2col<<<(total_col + BLOCK_1D - 1) / BLOCK_1D, BLOCK_1D, 0, g_stream>>>(
-            d_col, d_in, in_ch, H, W, kH, kW, outH, outW, stride, padding);
+        /* im2col with 64-bit indexing for large convolutions */
+        size_t total_col = (size_t)in_ch * kH * kW * outH * outW;
+        size_t grid_size = (total_col + BLOCK_1D - 1) / BLOCK_1D;
+        k_im2col<<<grid_size, BLOCK_1D, 0, g_stream>>>(
+            d_col, d_in, in_ch, H, W, kH, kW, outH, outW, stride, padding, total_col);
 
         /* GEMM: out = weight @ col
          * weight: [out_ch, col_rows], col: [col_rows, col_cols]
