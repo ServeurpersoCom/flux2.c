@@ -294,6 +294,15 @@ void flux_cuda_qk_norm_t(int q_id, int k_id, const float *qw, const float *kw,
                          int seq, int heads, int hdim, float eps);
 void flux_cuda_rope_t(int x_id, const float *cos_f, const float *sin_f,
                       int seq, int heads, int hdim, int axis_dim);
+void flux_cuda_rope_offset_t(int x_id, const float *cos_f, const float *sin_f,
+                              int seq_len, int seq_offset, int heads, int hdim, int axis_dim);
+
+/* GPU attention using batched cuBLAS gemm
+ * Q,K,V,out are tensor IDs with layout [seq, heads, hdim]
+ * Returns 1 on success, 0 on failure
+ */
+int flux_cuda_attention_t(int out_id, int q_id, int k_id, int v_id,
+                          int seq, int heads, int hdim, float scale);
 
 #ifdef __cplusplus
 }
