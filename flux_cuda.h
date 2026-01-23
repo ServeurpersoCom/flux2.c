@@ -271,6 +271,7 @@ void flux_cuda_tensor_upload(int tensor_id, const float *data, size_t size);
  * Download GPU tensor data to CPU.
  */
 void flux_cuda_tensor_download(int tensor_id, float *data, size_t size);
+void flux_cuda_memcpy_d2d(int dst_id, size_t dst_offset, int src_id, size_t src_offset, size_t size);
 
 /*
  * GPU-to-GPU sgemm. A_id and C_id are tensor IDs, B is weight pointer.

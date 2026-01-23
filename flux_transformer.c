@@ -1580,6 +1580,185 @@ static void swiglu_ffn_bf16(float *out, const float *x,
  * (shift1, scale1, gate1, shift2, scale2, gate2 for each stream).
  * These are computed once per step and reused for all 5 double blocks.
  */
+
+#ifdef USE_CUDA
+/* CUDA-optimized double block: keeps tensors on GPU between operations
+ * img_mod/txt_mod contain pre-computed modulation parameters
+ * These are computed once per step and reused for all 5 double blocks.
+ */
+static int double_block_forward_cuda(float *img_hidden, float *txt_hidden,
+                                      const double_block_t *block,
+                                      const float *img_mod, const float *txt_mod,
+                                      const float *img_rope_cos, const float *img_rope_sin,
+                                      const float *txt_rope_cos, const float *txt_rope_sin,
+                                      int img_seq, int txt_seq,
+                                      flux_transformer_t *tf) {
+    if (!flux_cuda_available()) return 0;
+    /* Need f32 weights */
+    if (!block->img_q_weight || !block->img_proj_weight) return 0;
+
+    int h = tf->hidden_size;
+    int heads = tf->num_heads;
+    int head_dim = tf->head_dim;
+    int mlp = tf->mlp_hidden;
+    int total_seq = img_seq + txt_seq;
+    float eps = 1e-6f;
+
+    /* Extract pre-computed modulation parameters */
+    const float *img_shift1 = img_mod, *img_scale1 = img_mod + h, *img_gate1 = img_mod + h*2;
+    const float *img_shift2 = img_mod + h*3, *img_scale2 = img_mod + h*4, *img_gate2 = img_mod + h*5;
+    const float *txt_shift1 = txt_mod, *txt_scale1 = txt_mod + h, *txt_gate1 = txt_mod + h*2;
+    const float *txt_shift2 = txt_mod + h*3, *txt_scale2 = txt_mod + h*4, *txt_gate2 = txt_mod + h*5;
+
+    /* === Phase 2: Allocate GPU tensors === */
+    size_t sz_img = img_seq * h * sizeof(float);
+    size_t sz_txt = txt_seq * h * sizeof(float);
+    size_t sz_cat = total_seq * h * sizeof(float);
+    size_t sz_img_mlp = img_seq * mlp * sizeof(float);
+    size_t sz_txt_mlp = txt_seq * mlp * sizeof(float);
+
+    int t_img_h = flux_cuda_tensor_get(sz_img);      /* img_hidden */
+    int t_txt_h = flux_cuda_tensor_get(sz_txt);      /* txt_hidden */
+    int t_img_norm = flux_cuda_tensor_get(sz_img);   /* img after adaln */
+    int t_txt_norm = flux_cuda_tensor_get(sz_txt);
+    int t_img_q = flux_cuda_tensor_get(sz_img);
+    int t_img_k = flux_cuda_tensor_get(sz_img);
+    int t_img_v = flux_cuda_tensor_get(sz_img);
+    int t_txt_q = flux_cuda_tensor_get(sz_txt);
+    int t_txt_k = flux_cuda_tensor_get(sz_txt);
+    int t_txt_v = flux_cuda_tensor_get(sz_txt);
+    int t_cat_k = flux_cuda_tensor_get(sz_cat);
+    int t_cat_v = flux_cuda_tensor_get(sz_cat);
+    int t_img_attn = flux_cuda_tensor_get(sz_img);
+    int t_txt_attn = flux_cuda_tensor_get(sz_txt);
+    int t_img_proj = flux_cuda_tensor_get(sz_img);
+    int t_txt_proj = flux_cuda_tensor_get(sz_txt);
+    int t_img_gate = flux_cuda_tensor_get(sz_img_mlp);
+    int t_img_up = flux_cuda_tensor_get(sz_img_mlp);
+    int t_txt_gate = flux_cuda_tensor_get(sz_txt_mlp);
+    int t_txt_up = flux_cuda_tensor_get(sz_txt_mlp);
+
+    if (t_img_h < 0 || t_txt_h < 0 || t_img_norm < 0 || t_txt_norm < 0 ||
+        t_img_q < 0 || t_img_k < 0 || t_img_v < 0 ||
+        t_txt_q < 0 || t_txt_k < 0 || t_txt_v < 0 ||
+        t_cat_k < 0 || t_cat_v < 0 || t_img_attn < 0 || t_txt_attn < 0 ||
+        t_img_proj < 0 || t_txt_proj < 0 ||
+        t_img_gate < 0 || t_img_up < 0 || t_txt_gate < 0 || t_txt_up < 0) {
+        /* Cleanup and fallback */
+        flux_cuda_tensor_release(t_img_h); flux_cuda_tensor_release(t_txt_h);
+        flux_cuda_tensor_release(t_img_norm); flux_cuda_tensor_release(t_txt_norm);
+        flux_cuda_tensor_release(t_img_q); flux_cuda_tensor_release(t_img_k); flux_cuda_tensor_release(t_img_v);
+        flux_cuda_tensor_release(t_txt_q); flux_cuda_tensor_release(t_txt_k); flux_cuda_tensor_release(t_txt_v);
+        flux_cuda_tensor_release(t_cat_k); flux_cuda_tensor_release(t_cat_v);
+        flux_cuda_tensor_release(t_img_attn); flux_cuda_tensor_release(t_txt_attn);
+        flux_cuda_tensor_release(t_img_proj); flux_cuda_tensor_release(t_txt_proj);
+        flux_cuda_tensor_release(t_img_gate); flux_cuda_tensor_release(t_img_up);
+        flux_cuda_tensor_release(t_txt_gate); flux_cuda_tensor_release(t_txt_up);
+        return 0;
+    }
+
+    /* === Phase 3: Upload hidden states === */
+    flux_cuda_tensor_upload(t_img_h, img_hidden, sz_img);
+    flux_cuda_tensor_upload(t_txt_h, txt_hidden, sz_txt);
+
+    /* === Phase 4: Image stream - AdaLN + QKV === */
+    flux_cuda_adaln_t(t_img_norm, t_img_h, img_shift1, img_scale1, img_seq, h, eps);
+    flux_cuda_sgemm_gpu(0, 1, img_seq, h, h, 1.0f, t_img_norm, h, block->img_q_weight, h, 0.0f, t_img_q, h);
+    flux_cuda_sgemm_gpu(0, 1, img_seq, h, h, 1.0f, t_img_norm, h, block->img_k_weight, h, 0.0f, t_img_k, h);
+    flux_cuda_sgemm_gpu(0, 1, img_seq, h, h, 1.0f, t_img_norm, h, block->img_v_weight, h, 0.0f, t_img_v, h);
+    flux_cuda_qk_norm_t(t_img_q, t_img_k, block->img_norm_q_weight, block->img_norm_k_weight, img_seq, heads, head_dim, eps);
+
+    /* === Phase 5: Text stream - AdaLN + QKV === */
+    flux_cuda_adaln_t(t_txt_norm, t_txt_h, txt_shift1, txt_scale1, txt_seq, h, eps);
+    flux_cuda_sgemm_gpu(0, 1, txt_seq, h, h, 1.0f, t_txt_norm, h, block->txt_q_weight, h, 0.0f, t_txt_q, h);
+    flux_cuda_sgemm_gpu(0, 1, txt_seq, h, h, 1.0f, t_txt_norm, h, block->txt_k_weight, h, 0.0f, t_txt_k, h);
+    flux_cuda_sgemm_gpu(0, 1, txt_seq, h, h, 1.0f, t_txt_norm, h, block->txt_v_weight, h, 0.0f, t_txt_v, h);
+    flux_cuda_qk_norm_t(t_txt_q, t_txt_k, block->txt_norm_q_weight, block->txt_norm_k_weight, txt_seq, heads, head_dim, eps);
+
+    /* === Phase 6: RoPE on CPU (download, apply, re-upload) === */
+    float *img_q_cpu = tf->work2;
+    float *img_k_cpu = img_q_cpu + img_seq * h;
+    float *txt_q_cpu = tf->work2 + (img_seq * 2) * h;
+    float *txt_k_cpu = txt_q_cpu + txt_seq * h;
+
+    flux_cuda_tensor_download(t_img_q, img_q_cpu, sz_img);
+    flux_cuda_tensor_download(t_img_k, img_k_cpu, sz_img);
+    flux_cuda_tensor_download(t_txt_q, txt_q_cpu, sz_txt);
+    flux_cuda_tensor_download(t_txt_k, txt_k_cpu, sz_txt);
+    flux_cuda_sync();
+
+    int axis_dim = 32;
+    apply_rope_2d(img_q_cpu, img_rope_cos, img_rope_sin, img_seq, heads, head_dim, axis_dim);
+    apply_rope_2d(img_k_cpu, img_rope_cos, img_rope_sin, img_seq, heads, head_dim, axis_dim);
+    apply_rope_2d(txt_q_cpu, txt_rope_cos, txt_rope_sin, txt_seq, heads, head_dim, axis_dim);
+    apply_rope_2d(txt_k_cpu, txt_rope_cos, txt_rope_sin, txt_seq, heads, head_dim, axis_dim);
+
+    flux_cuda_tensor_upload(t_img_q, img_q_cpu, sz_img);
+    flux_cuda_tensor_upload(t_img_k, img_k_cpu, sz_img);
+    flux_cuda_tensor_upload(t_txt_q, txt_q_cpu, sz_txt);
+    flux_cuda_tensor_upload(t_txt_k, txt_k_cpu, sz_txt);
+
+    /* === Phase 7: Concat K,V and joint attention === */
+    /* cat_k = [txt_k, img_k], cat_v = [txt_v, img_v] */
+    flux_cuda_memcpy_d2d(t_cat_k, 0, t_txt_k, 0, sz_txt);
+    flux_cuda_memcpy_d2d(t_cat_v, 0, t_txt_v, 0, sz_txt);
+    flux_cuda_memcpy_d2d(t_cat_k, sz_txt, t_img_k, 0, sz_img);
+    flux_cuda_memcpy_d2d(t_cat_v, sz_txt, t_img_v, 0, sz_img);
+
+    float scale = 1.0f / sqrtf((float)head_dim);
+    flux_cuda_joint_attention_t(t_img_attn, t_txt_attn, t_img_q, t_txt_q,
+                                 t_cat_k, t_cat_v, img_seq, txt_seq, heads, head_dim, scale);
+
+    /* === Phase 8: Attention output projections === */
+    flux_cuda_sgemm_gpu(0, 1, img_seq, h, h, 1.0f, t_img_attn, h, block->img_proj_weight, h, 0.0f, t_img_proj, h);
+    flux_cuda_sgemm_gpu(0, 1, txt_seq, h, h, 1.0f, t_txt_attn, h, block->txt_proj_weight, h, 0.0f, t_txt_proj, h);
+
+    /* === Phase 9: Gated add for attention === */
+    flux_cuda_gated_add_t(t_img_h, img_gate1, t_img_proj, img_seq, h);
+    flux_cuda_gated_add_t(t_txt_h, txt_gate1, t_txt_proj, txt_seq, h);
+
+    /* === Phase 10: FFN - AdaLN + SwiGLU === */
+    flux_cuda_adaln_t(t_img_norm, t_img_h, img_shift2, img_scale2, img_seq, h, eps);
+    flux_cuda_adaln_t(t_txt_norm, t_txt_h, txt_shift2, txt_scale2, txt_seq, h, eps);
+
+    /* Image FFN: gate, up projections */
+    flux_cuda_sgemm_gpu(0, 1, img_seq, mlp, h, 1.0f, t_img_norm, h, block->img_mlp_gate_weight, h, 0.0f, t_img_gate, mlp);
+    flux_cuda_sgemm_gpu(0, 1, img_seq, mlp, h, 1.0f, t_img_norm, h, block->img_mlp_up_weight, h, 0.0f, t_img_up, mlp);
+    flux_cuda_silu_t(t_img_gate, img_seq * mlp);
+    flux_cuda_mul_t(t_img_gate, t_img_up, img_seq * mlp);
+    flux_cuda_sgemm_gpu(0, 1, img_seq, h, mlp, 1.0f, t_img_gate, mlp, block->img_mlp_down_weight, mlp, 0.0f, t_img_proj, h);
+
+    /* Text FFN: gate, up projections */
+    flux_cuda_sgemm_gpu(0, 1, txt_seq, mlp, h, 1.0f, t_txt_norm, h, block->txt_mlp_gate_weight, h, 0.0f, t_txt_gate, mlp);
+    flux_cuda_sgemm_gpu(0, 1, txt_seq, mlp, h, 1.0f, t_txt_norm, h, block->txt_mlp_up_weight, h, 0.0f, t_txt_up, mlp);
+    flux_cuda_silu_t(t_txt_gate, txt_seq * mlp);
+    flux_cuda_mul_t(t_txt_gate, t_txt_up, txt_seq * mlp);
+    flux_cuda_sgemm_gpu(0, 1, txt_seq, h, mlp, 1.0f, t_txt_gate, mlp, block->txt_mlp_down_weight, mlp, 0.0f, t_txt_proj, h);
+
+    /* === Phase 11: Gated add for FFN === */
+    flux_cuda_gated_add_t(t_img_h, img_gate2, t_img_proj, img_seq, h);
+    flux_cuda_gated_add_t(t_txt_h, txt_gate2, t_txt_proj, txt_seq, h);
+
+    /* === Phase 12: Download results === */
+    flux_cuda_tensor_download(t_img_h, img_hidden, sz_img);
+    flux_cuda_tensor_download(t_txt_h, txt_hidden, sz_txt);
+    flux_cuda_sync();
+
+    /* === Cleanup === */
+    flux_cuda_tensor_release(t_img_h); flux_cuda_tensor_release(t_txt_h);
+    flux_cuda_tensor_release(t_img_norm); flux_cuda_tensor_release(t_txt_norm);
+    flux_cuda_tensor_release(t_img_q); flux_cuda_tensor_release(t_img_k); flux_cuda_tensor_release(t_img_v);
+    flux_cuda_tensor_release(t_txt_q); flux_cuda_tensor_release(t_txt_k); flux_cuda_tensor_release(t_txt_v);
+    flux_cuda_tensor_release(t_cat_k); flux_cuda_tensor_release(t_cat_v);
+    flux_cuda_tensor_release(t_img_attn); flux_cuda_tensor_release(t_txt_attn);
+    flux_cuda_tensor_release(t_img_proj); flux_cuda_tensor_release(t_txt_proj);
+    flux_cuda_tensor_release(t_img_gate); flux_cuda_tensor_release(t_img_up);
+    flux_cuda_tensor_release(t_txt_gate); flux_cuda_tensor_release(t_txt_up);
+
+    return 1;
+}
+#endif /* USE_CUDA */
+
 static void double_block_forward(float *img_hidden, float *txt_hidden,
                                  const double_block_t *block,
                                  const float *img_mod, const float *txt_mod,
@@ -3063,6 +3242,17 @@ float *flux_transformer_forward(flux_transformer_t *tf,
             load_double_block_weights(&tf->double_blocks[i], tf->sf, i,
                                       tf->hidden_size, tf->mlp_hidden, tf->use_bf16);
         }
+#ifdef USE_CUDA
+        /* Try CUDA-optimized path first */
+        if (!double_block_forward_cuda(img_hidden, txt_hidden,
+                             &tf->double_blocks[i],
+                             t_emb,
+                             tf->adaln_double_img_weight,
+                             tf->adaln_double_txt_weight,
+                             img_rope_cos, img_rope_sin,
+                             txt_rope_cos, txt_rope_sin,
+                             img_seq, txt_seq, tf))
+#endif
         double_block_forward(img_hidden, txt_hidden,
                              &tf->double_blocks[i],
                              tf->double_mod_img, tf->double_mod_txt,

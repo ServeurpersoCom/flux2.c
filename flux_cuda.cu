@@ -189,6 +189,15 @@ void flux_cuda_tensor_download(int id, float *data, size_t size) {
     cudaStreamSynchronize(g_stream);
 }
 
+/* Copy between GPU tensors (device to device) */
+void flux_cuda_memcpy_d2d(int dst_id, size_t dst_offset, int src_id, size_t src_offset, size_t size) {
+    if (dst_id < 0 || dst_id >= GPU_TENSOR_POOL_SIZE || !g_tensor_pool[dst_id].ptr) return;
+    if (src_id < 0 || src_id >= GPU_TENSOR_POOL_SIZE || !g_tensor_pool[src_id].ptr) return;
+    float *dst = g_tensor_pool[dst_id].ptr + dst_offset / sizeof(float);
+    float *src = g_tensor_pool[src_id].ptr + src_offset / sizeof(float);
+    cudaMemcpyAsync(dst, src, size, cudaMemcpyDeviceToDevice, g_stream);
+}
+
 static void free_tensor_pool(void) {
     for (int i = 0; i < GPU_TENSOR_POOL_SIZE; i++) {
         if (g_tensor_pool[i].ptr) {
