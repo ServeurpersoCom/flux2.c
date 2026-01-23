@@ -14,7 +14,8 @@ Even if the code was generated using AI, my help in steering towards the right d
 
 ```bash
 # Build (choose your backend)
-make mps       # Apple Silicon (fastest)
+make cuda      # NVIDIA GPU (fastest on Linux)
+# or: make mps     # Apple Silicon (fastest on macOS)
 # or: make blas    # Intel Mac / Linux with OpenBLAS
 # or: make generic # Pure C, no dependencies
 
@@ -26,7 +27,7 @@ python download_model.py
 ./flux -d flux-klein-model -p "A woman wearing sunglasses" -o output.png
 ```
 
-That's it. No Python runtime, no PyTorch, no CUDA toolkit required at inference time.
+That's it. No Python runtime, no PyTorch required at inference time.
 
 ## Example Output
 
@@ -37,6 +38,7 @@ That's it. No Python runtime, no PyTorch, no CUDA toolkit required at inference 
 ## Features
 
 - **Zero dependencies**: Pure C implementation, works standalone. BLAS optional for ~30x speedup (Apple Accelerate on macOS, OpenBLAS on Linux)
+- **CUDA GPU acceleration**: Full pipeline on NVIDIA GPUs (Linux), 3-10x faster than CPU BLAS
 - **Metal GPU acceleration**: Automatic on Apple Silicon Macs
 - **Text-to-image**: Generate images from text prompts
 - **Image-to-image**: Transform existing images guided by prompts
@@ -144,10 +146,12 @@ Choose a backend when building:
 make            # Show available backends
 make generic    # Pure C, no dependencies (slow)
 make blas       # BLAS acceleration (~30x faster)
-make mps        # Apple Silicon Metal GPU (fastest, macOS only)
+make cuda       # NVIDIA GPU acceleration (Linux, fastest)
+make mps        # Apple Silicon Metal GPU (macOS, fastest)
 ```
 
 **Recommended:**
+- Linux with NVIDIA GPU: `make cuda`
 - macOS Apple Silicon: `make mps`
 - macOS Intel: `make blas`
 - Linux with OpenBLAS: `make blas`
@@ -160,6 +164,16 @@ sudo apt install libopenblas-dev
 
 # Fedora
 sudo dnf install openblas-devel
+```
+
+For `make cuda` on Linux, install CUDA Toolkit:
+```bash
+# Ubuntu/Debian (NVIDIA official repo recommended)
+# See: https://developer.nvidia.com/cuda-downloads
+
+# Verify installation
+nvcc --version
+nvidia-smi
 ```
 
 Other targets:
@@ -191,6 +205,86 @@ python3 run_test.py --help
 python3 run_test.py --quick          # Quick test only
 python3 run_test.py --flux-binary ./flux --model-dir /path/to/model
 ```
+
+## CUDA Backend (NVIDIA GPUs)
+
+The CUDA backend provides full GPU acceleration for NVIDIA GPUs on Linux, achieving 3-10x speedup over CPU BLAS (scaling with resolution).
+
+### Requirements
+
+- CUDA Toolkit 11.0+ (nvcc compiler)
+- cuBLAS library (included with CUDA Toolkit)
+- NVIDIA GPU with compute capability 5.0+ (Maxwell or newer)
+- OpenBLAS (for CPU fallback operations)
+
+### Building
+
+```bash
+make cuda
+```
+
+The Makefile auto-detects your GPU architecture. To override:
+```bash
+CUDA_ARCH=sm_86 make cuda   # RTX 30xx (Ampere)
+CUDA_ARCH=sm_89 make cuda   # RTX 40xx (Ada Lovelace)
+CUDA_ARCH=sm_120 make cuda  # RTX 50xx (Blackwell)
+```
+
+### Performance
+
+Benchmarks on RTX PRO 6000 Blackwell (96GB VRAM), FLUX-Klein 4B FP32:
+
+| Resolution | CUDA   | CPU BLAS | Speedup |
+|------------|--------|----------|---------|
+| 256×256    | 6.2s   | 20.8s    | 3.4x    |
+| 512×512    | 7.0s   | 37.7s    | 5.4x    |
+| 1024×1024  | 11.4s  | 118.4s   | 10.4x   |
+
+**Breakdown (1024×1024):**
+- Text encoding: 1.8s (Qwen3 causal attention on GPU)
+- Transformer denoising: 3.3s (joint attention, RoPE on GPU)
+- VAE decode: 3.6s (im2col + cuBLAS convolutions)
+
+### VRAM Usage
+
+| Phase | Peak VRAM | Notes |
+|-------|-----------|-------|
+| Text encoding | ~0.6 GB | Weights streamed from CPU |
+| Transformer | ~20 GB | Weights + attention scores |
+| VAE decode | ~34 GB | im2col buffer for large convs |
+
+The peak of ~34GB occurs during VAE decode at 1024×1024. For GPUs with less VRAM:
+- 512×512 works on 16GB+ GPUs
+- 256×256 works on 8GB+ GPUs
+
+### Features
+
+The CUDA backend accelerates:
+- **cuBLAS GEMM**: All matrix multiplications via Tensor Cores (TF32 on Ampere+)
+- **Attention**: Batched Q@K and softmax with custom kernels
+- **Activations**: SiLU, GELU, RMSNorm on GPU
+- **RoPE**: 2D rotary position embeddings
+- **Conv2d**: im2col + cuBLAS for VAE decoder
+- **Weight caching**: Transformer weights stay on GPU between steps
+
+### Troubleshooting
+
+**"nvcc: command not found"**
+```bash
+# Add CUDA to PATH
+export PATH=/usr/local/cuda/bin:$PATH
+export LD_LIBRARY_PATH=/usr/local/cuda/lib64:$LD_LIBRARY_PATH
+```
+
+**"CUDA error: out of memory"**
+- Reduce resolution (`-W 512 -H 512`)
+- Close other GPU applications
+- Check VRAM with `nvidia-smi`
+
+**Slow performance**
+- Verify GPU is being used: look for "CUDA: <GPU name>" in output
+- Ensure TF32 is enabled (automatic on Ampere+)
+- Check for thermal throttling with `nvidia-smi -q -d PERFORMANCE`
 
 ## Model Download
 
