@@ -304,6 +304,12 @@ void flux_cuda_rope_offset_t(int x_id, const float *cos_f, const float *sin_f,
 int flux_cuda_attention_t(int out_id, int q_id, int k_id, int v_id,
                           int seq, int heads, int hdim, float scale);
 
+/* Joint attention for double blocks - img and txt Q attend to concatenated K,V */
+int flux_cuda_joint_attention_t(int img_out_id, int txt_out_id,
+                                 int img_q_id, int txt_q_id,
+                                 int cat_k_id, int cat_v_id,
+                                 int img_seq, int txt_seq, int heads, int hdim, float scale);
+
 #ifdef __cplusplus
 }
 #endif

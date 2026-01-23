@@ -1139,3 +1139,115 @@ int flux_cuda_attention_t(int out_id, int q_id, int k_id, int v_id,
     cudaFree(d_qt); cudaFree(d_kt); cudaFree(d_vt); cudaFree(d_ot); cudaFree(d_scores);
     return 1;
 }
+
+/* Joint attention for double blocks: Q attends to concatenated K,V
+ * img_q: [img_seq, heads, hdim], txt_q: [txt_seq, heads, hdim]
+ * cat_k, cat_v: [total_seq, heads, hdim] where total_seq = txt_seq + img_seq
+ * Returns 1 on success
+ */
+int flux_cuda_joint_attention_t(int img_out_id, int txt_out_id,
+                                 int img_q_id, int txt_q_id,
+                                 int cat_k_id, int cat_v_id,
+                                 int img_seq, int txt_seq, int heads, int hdim, float scale) {
+    if (!g_available) return 0;
+
+    int total_seq = img_seq + txt_seq;
+
+    float *d_img_q = flux_cuda_tensor_ptr(img_q_id);
+    float *d_txt_q = flux_cuda_tensor_ptr(txt_q_id);
+    float *d_cat_k = flux_cuda_tensor_ptr(cat_k_id);
+    float *d_cat_v = flux_cuda_tensor_ptr(cat_v_id);
+    float *d_img_out = flux_cuda_tensor_ptr(img_out_id);
+    float *d_txt_out = flux_cuda_tensor_ptr(txt_out_id);
+
+    if (!d_img_q || !d_txt_q || !d_cat_k || !d_cat_v || !d_img_out || !d_txt_out) return 0;
+
+    /* Allocate transposed buffers */
+    size_t sz_img_q = (size_t)img_seq * heads * hdim * sizeof(float);
+    size_t sz_txt_q = (size_t)txt_seq * heads * hdim * sizeof(float);
+    size_t sz_cat = (size_t)total_seq * heads * hdim * sizeof(float);
+    size_t sz_img_scores = (size_t)heads * img_seq * total_seq * sizeof(float);
+    size_t sz_txt_scores = (size_t)heads * txt_seq * total_seq * sizeof(float);
+
+    float *d_img_qt, *d_txt_qt, *d_cat_kt, *d_cat_vt;
+    float *d_img_ot, *d_txt_ot, *d_img_scores, *d_txt_scores;
+
+    if (cudaMalloc(&d_img_qt, sz_img_q) != cudaSuccess) return 0;
+    if (cudaMalloc(&d_txt_qt, sz_txt_q) != cudaSuccess) { cudaFree(d_img_qt); return 0; }
+    if (cudaMalloc(&d_cat_kt, sz_cat) != cudaSuccess) { cudaFree(d_img_qt); cudaFree(d_txt_qt); return 0; }
+    if (cudaMalloc(&d_cat_vt, sz_cat) != cudaSuccess) { cudaFree(d_img_qt); cudaFree(d_txt_qt); cudaFree(d_cat_kt); return 0; }
+    if (cudaMalloc(&d_img_ot, sz_img_q) != cudaSuccess) { cudaFree(d_img_qt); cudaFree(d_txt_qt); cudaFree(d_cat_kt); cudaFree(d_cat_vt); return 0; }
+    if (cudaMalloc(&d_txt_ot, sz_txt_q) != cudaSuccess) { cudaFree(d_img_qt); cudaFree(d_txt_qt); cudaFree(d_cat_kt); cudaFree(d_cat_vt); cudaFree(d_img_ot); return 0; }
+    if (cudaMalloc(&d_img_scores, sz_img_scores) != cudaSuccess) { cudaFree(d_img_qt); cudaFree(d_txt_qt); cudaFree(d_cat_kt); cudaFree(d_cat_vt); cudaFree(d_img_ot); cudaFree(d_txt_ot); return 0; }
+    if (cudaMalloc(&d_txt_scores, sz_txt_scores) != cudaSuccess) { cudaFree(d_img_qt); cudaFree(d_txt_qt); cudaFree(d_cat_kt); cudaFree(d_cat_vt); cudaFree(d_img_ot); cudaFree(d_txt_ot); cudaFree(d_img_scores); return 0; }
+
+    /* Transpose all inputs */
+    int img_total = img_seq * heads * hdim;
+    int txt_total = txt_seq * heads * hdim;
+    int cat_total = total_seq * heads * hdim;
+
+    k_transpose_shd_to_hsd<<<(img_total + BLOCK_1D - 1) / BLOCK_1D, BLOCK_1D, 0, g_stream>>>(d_img_qt, d_img_q, img_seq, heads, hdim);
+    k_transpose_shd_to_hsd<<<(txt_total + BLOCK_1D - 1) / BLOCK_1D, BLOCK_1D, 0, g_stream>>>(d_txt_qt, d_txt_q, txt_seq, heads, hdim);
+    k_transpose_shd_to_hsd<<<(cat_total + BLOCK_1D - 1) / BLOCK_1D, BLOCK_1D, 0, g_stream>>>(d_cat_kt, d_cat_k, total_seq, heads, hdim);
+    k_transpose_shd_to_hsd<<<(cat_total + BLOCK_1D - 1) / BLOCK_1D, BLOCK_1D, 0, g_stream>>>(d_cat_vt, d_cat_v, total_seq, heads, hdim);
+
+    float alpha = 1.0f, beta = 0.0f;
+
+    /* Image attention: img_Q @ cat_K^T -> [heads, img_seq, total_seq] */
+    cublasSgemmStridedBatched(g_cublas,
+        CUBLAS_OP_T, CUBLAS_OP_N,
+        total_seq, img_seq, hdim,
+        &alpha,
+        d_cat_kt, hdim, (long long)total_seq * hdim,
+        d_img_qt, hdim, (long long)img_seq * hdim,
+        &beta,
+        d_img_scores, total_seq, (long long)img_seq * total_seq,
+        heads);
+
+    /* Softmax for image scores */
+    k_softmax_attention<<<heads * img_seq, 256, 0, g_stream>>>(d_img_scores, heads, img_seq, total_seq, scale);
+
+    /* Image output: scores @ cat_V -> [heads, img_seq, hdim] */
+    cublasSgemmStridedBatched(g_cublas,
+        CUBLAS_OP_N, CUBLAS_OP_N,
+        hdim, img_seq, total_seq,
+        &alpha,
+        d_cat_vt, hdim, (long long)total_seq * hdim,
+        d_img_scores, total_seq, (long long)img_seq * total_seq,
+        &beta,
+        d_img_ot, hdim, (long long)img_seq * hdim,
+        heads);
+
+    /* Text attention: txt_Q @ cat_K^T -> [heads, txt_seq, total_seq] */
+    cublasSgemmStridedBatched(g_cublas,
+        CUBLAS_OP_T, CUBLAS_OP_N,
+        total_seq, txt_seq, hdim,
+        &alpha,
+        d_cat_kt, hdim, (long long)total_seq * hdim,
+        d_txt_qt, hdim, (long long)txt_seq * hdim,
+        &beta,
+        d_txt_scores, total_seq, (long long)txt_seq * total_seq,
+        heads);
+
+    /* Softmax for text scores */
+    k_softmax_attention<<<heads * txt_seq, 256, 0, g_stream>>>(d_txt_scores, heads, txt_seq, total_seq, scale);
+
+    /* Text output: scores @ cat_V -> [heads, txt_seq, hdim] */
+    cublasSgemmStridedBatched(g_cublas,
+        CUBLAS_OP_N, CUBLAS_OP_N,
+        hdim, txt_seq, total_seq,
+        &alpha,
+        d_cat_vt, hdim, (long long)total_seq * hdim,
+        d_txt_scores, total_seq, (long long)txt_seq * total_seq,
+        &beta,
+        d_txt_ot, hdim, (long long)txt_seq * hdim,
+        heads);
+
+    /* Transpose outputs back */
+    k_transpose_hsd_to_shd<<<(img_total + BLOCK_1D - 1) / BLOCK_1D, BLOCK_1D, 0, g_stream>>>(d_img_out, d_img_ot, img_seq, heads, hdim);
+    k_transpose_hsd_to_shd<<<(txt_total + BLOCK_1D - 1) / BLOCK_1D, BLOCK_1D, 0, g_stream>>>(d_txt_out, d_txt_ot, txt_seq, heads, hdim);
+
+    cudaFree(d_img_qt); cudaFree(d_txt_qt); cudaFree(d_cat_kt); cudaFree(d_cat_vt);
+    cudaFree(d_img_ot); cudaFree(d_txt_ot); cudaFree(d_img_scores); cudaFree(d_txt_scores);
+    return 1;
+}
