@@ -921,6 +921,36 @@ void flux_cuda_qk_norm_t(int q_id, int k_id, const float *qw, const float *kw,
     cudaFree(d_qw); cudaFree(d_kw);
 }
 
+/* RoPE 2D using tensor pool for cos/sin - full head_dim version */
+void flux_cuda_rope_2d_full_t(int x_id, const float *cos_f, const float *sin_f,
+                               int seq, int heads, int hdim) {
+    if (!g_available) return;
+    float *d_x = flux_cuda_tensor_ptr(x_id);
+    if (!d_x) return;
+
+    size_t szf = (size_t)seq * hdim * sizeof(float);
+    int t_c = flux_cuda_tensor_get(szf);
+    int t_s = flux_cuda_tensor_get(szf);
+    if (t_c < 0 || t_s < 0) {
+        flux_cuda_tensor_release(t_c);
+        flux_cuda_tensor_release(t_s);
+        return;
+    }
+
+    float *d_c = flux_cuda_tensor_ptr(t_c);
+    float *d_s = flux_cuda_tensor_ptr(t_s);
+    cudaMemcpyAsync(d_c, cos_f, szf, cudaMemcpyHostToDevice, g_stream);
+    cudaMemcpyAsync(d_s, sin_f, szf, cudaMemcpyHostToDevice, g_stream);
+
+    /* Apply to all pairs in head_dim */
+    int total = seq * heads * (hdim / 2);
+    k_rope_2d_offset<<<(total + BLOCK_1D - 1) / BLOCK_1D, BLOCK_1D, 0, g_stream>>>(
+        d_x, d_c, d_s, seq, 0, heads, hdim, hdim);
+
+    flux_cuda_tensor_release(t_c);
+    flux_cuda_tensor_release(t_s);
+}
+
 void flux_cuda_rope_t(int x_id, const float *cos_f, const float *sin_f,
                       int seq, int heads, int hdim, int axis_dim) {
     if (!g_available) return;
@@ -939,25 +969,36 @@ void flux_cuda_rope_t(int x_id, const float *cos_f, const float *sin_f,
     cudaFree(d_c); cudaFree(d_s);
 }
 
-/* RoPE with offset - applies to portion of tensor starting at seq_offset */
+/* RoPE with offset - applies to portion of tensor starting at seq_offset
+ * Uses tensor pool instead of malloc/free */
 void flux_cuda_rope_offset_t(int x_id, const float *cos_f, const float *sin_f,
                               int seq_len, int seq_offset, int heads, int hdim, int axis_dim) {
+    (void)axis_dim;  /* We use hdim directly */
     if (!g_available) return;
     float *d_x = flux_cuda_tensor_ptr(x_id);
     if (!d_x) return;
 
     /* cos/sin are [seq_len, hdim] */
     size_t szf = (size_t)seq_len * hdim * sizeof(float);
-    float *d_c, *d_s;
-    CUDA_CHECK(cudaMalloc(&d_c, szf)); CUDA_CHECK(cudaMalloc(&d_s, szf));
-    CUDA_CHECK(cudaMemcpyAsync(d_c, cos_f, szf, cudaMemcpyHostToDevice, g_stream));
-    CUDA_CHECK(cudaMemcpyAsync(d_s, sin_f, szf, cudaMemcpyHostToDevice, g_stream));
+    int t_c = flux_cuda_tensor_get(szf);
+    int t_s = flux_cuda_tensor_get(szf);
+    if (t_c < 0 || t_s < 0) {
+        flux_cuda_tensor_release(t_c);
+        flux_cuda_tensor_release(t_s);
+        return;
+    }
+
+    float *d_c = flux_cuda_tensor_ptr(t_c);
+    float *d_s = flux_cuda_tensor_ptr(t_s);
+    cudaMemcpyAsync(d_c, cos_f, szf, cudaMemcpyHostToDevice, g_stream);
+    cudaMemcpyAsync(d_s, sin_f, szf, cudaMemcpyHostToDevice, g_stream);
 
     int total = seq_len * heads * (hdim / 2);
     k_rope_2d_offset<<<(total + BLOCK_1D - 1) / BLOCK_1D, BLOCK_1D, 0, g_stream>>>(
         d_x, d_c, d_s, seq_len, seq_offset, heads, hdim, axis_dim);
 
-    cudaFree(d_c); cudaFree(d_s);
+    flux_cuda_tensor_release(t_c);
+    flux_cuda_tensor_release(t_s);
 }
 
 /* ========================================================================
