@@ -242,6 +242,59 @@ const char* flux_cuda_device_name(void);
  */
 int flux_cuda_compute_capability(void);
 
+/* ========================================================================
+ * GPU Tensor Pool - Keep data on GPU between operations
+ * ======================================================================== */
+
+/*
+ * Get a GPU tensor from the pool (allocates if needed).
+ * Returns tensor ID or -1 on error.
+ */
+int flux_cuda_tensor_get(size_t size_bytes);
+
+/*
+ * Release a tensor back to the pool.
+ */
+void flux_cuda_tensor_release(int tensor_id);
+
+/*
+ * Get raw GPU pointer for a tensor.
+ */
+float* flux_cuda_tensor_ptr(int tensor_id);
+
+/*
+ * Upload CPU data to a GPU tensor.
+ */
+void flux_cuda_tensor_upload(int tensor_id, const float *data, size_t size);
+
+/*
+ * Download GPU tensor data to CPU.
+ */
+void flux_cuda_tensor_download(int tensor_id, float *data, size_t size);
+
+/*
+ * GPU-to-GPU sgemm. A_id and C_id are tensor IDs, B is weight pointer.
+ * Returns C_id on success, -1 on error.
+ */
+int flux_cuda_sgemm_gpu(int ta, int tb, int M, int N, int K,
+                        float alpha, int A_id, int lda,
+                        const float *B, int ldb,
+                        float beta, int C_id, int ldc);
+
+/* GPU Tensor operations - work directly on GPU tensors */
+void flux_cuda_gated_add_t(int out_id, const float *gate, int x_id, int seq, int hidden);
+void flux_cuda_split_fused_t(int fused_id, int q_id, int k_id, int v_id,
+                             int gate_id, int up_id, int seq, int h, int mlp);
+void flux_cuda_concat_t(int concat_id, int attn_id, int mlp_id, int seq, int h, int mlp);
+void flux_cuda_silu_t(int tensor_id, int n);
+void flux_cuda_mul_t(int a_id, int b_id, int n);
+void flux_cuda_adaln_t(int out_id, int x_id, const float *shift, const float *scale,
+                       int seq, int hid, float eps);
+void flux_cuda_qk_norm_t(int q_id, int k_id, const float *qw, const float *kw,
+                         int seq, int heads, int hdim, float eps);
+void flux_cuda_rope_t(int x_id, const float *cos_f, const float *sin_f,
+                      int seq, int heads, int hdim, int axis_dim);
+
 #ifdef __cplusplus
 }
 #endif

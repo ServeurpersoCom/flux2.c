@@ -123,7 +123,7 @@ CUDA_NVCCFLAGS = -O3 -use_fast_math --compiler-options "$(CFLAGS_BASE)"
 CUDA_LDFLAGS = $(LDFLAGS) -L$(CUDA_PATH)/lib64 -lcudart -lcublas -lopenblas -lstdc++
 
 # Auto-detect GPU architecture (default to common ones if detection fails)
-CUDA_ARCH ?= $(shell $(NVCC) --list-gpu-arch 2>/dev/null | tail -1 || echo "sm_75")
+CUDA_ARCH ?= sm_120
 CUDA_NVCCFLAGS += -arch=$(CUDA_ARCH)
 
 cuda: clean cuda-build
