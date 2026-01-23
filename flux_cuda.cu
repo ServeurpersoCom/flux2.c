@@ -529,6 +529,36 @@ __global__ void k_rope_2d(float *x, const float *cos_f, const float *sin_f,
     x[base + 1] = x0 * sn + x1 * c;
 }
 
+/* RoPE with sequence offset - applies to x starting at seq_offset
+ * x layout: [total_seq, heads, head_dim]
+ * cos/sin layout: [seq_len, head_dim] (full head_dim, not axis_dim)
+ */
+__global__ void k_rope_2d_offset(float *x, const float *cos_f, const float *sin_f,
+                                  int seq_len, int seq_offset, int heads, int hdim, int axis_dim) {
+    (void)axis_dim;  /* Not used - we apply to all head_dim pairs */
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = seq_len * heads * (hdim / 2);
+    if (idx >= total) return;
+
+    int s = idx / (heads * (hdim / 2));
+    int rem = idx % (heads * (hdim / 2));
+    int h = rem / (hdim / 2);
+    int d = rem % (hdim / 2);  /* pair index: 0..63 for hdim=128 */
+
+    /* cos/sin index: [s, d*2] */
+    int freq_idx = s * hdim + d * 2;
+    float c = cos_f[freq_idx];
+    float sn = sin_f[freq_idx];
+
+    /* x index with offset */
+    int base = (seq_offset + s) * heads * hdim + h * hdim + d * 2;
+    float x0 = x[base], x1 = x[base + 1];
+
+    /* Complex rotation: (x0 + i*x1) * (cos + i*sin) */
+    x[base] = x0 * c - x1 * sn;
+    x[base + 1] = x1 * c + x0 * sn;  /* Note: x1*cos + x0*sin, not x0*sin + x1*cos */
+}
+
 /* ========================================================================
  * cuBLAS Matrix Multiplication
  * ======================================================================== */
@@ -900,6 +930,27 @@ void flux_cuda_rope_t(int x_id, const float *cos_f, const float *sin_f,
     cudaFree(d_c); cudaFree(d_s);
 }
 
+/* RoPE with offset - applies to portion of tensor starting at seq_offset */
+void flux_cuda_rope_offset_t(int x_id, const float *cos_f, const float *sin_f,
+                              int seq_len, int seq_offset, int heads, int hdim, int axis_dim) {
+    if (!g_available) return;
+    float *d_x = flux_cuda_tensor_ptr(x_id);
+    if (!d_x) return;
+
+    /* cos/sin are [seq_len, hdim] */
+    size_t szf = (size_t)seq_len * hdim * sizeof(float);
+    float *d_c, *d_s;
+    CUDA_CHECK(cudaMalloc(&d_c, szf)); CUDA_CHECK(cudaMalloc(&d_s, szf));
+    CUDA_CHECK(cudaMemcpyAsync(d_c, cos_f, szf, cudaMemcpyHostToDevice, g_stream));
+    CUDA_CHECK(cudaMemcpyAsync(d_s, sin_f, szf, cudaMemcpyHostToDevice, g_stream));
+
+    int total = seq_len * heads * (hdim / 2);
+    k_rope_2d_offset<<<(total + BLOCK_1D - 1) / BLOCK_1D, BLOCK_1D, 0, g_stream>>>(
+        d_x, d_c, d_s, seq_len, seq_offset, heads, hdim, axis_dim);
+
+    cudaFree(d_c); cudaFree(d_s);
+}
+
 /* ========================================================================
  * Attention and Conv2D - Fall back to CPU for now
  * ======================================================================== */
@@ -926,4 +977,165 @@ int flux_cuda_causal_attention(float *out, const float *Q, const float *K, const
     (void)out; (void)Q; (void)K; (void)V; (void)attention_mask;
     (void)seq; (void)num_q_heads; (void)num_kv_heads; (void)head_dim; (void)scale;
     return 0;  /* Fall back to CPU */
+}
+
+/* ========================================================================
+ * GPU Tensor Attention - operates on tensor IDs
+ * Q,K,V layout: [seq, heads, head_dim] (packed as [seq, hidden])
+ * Uses cuBLAS batched gemm for all heads in parallel
+ * ======================================================================== */
+
+/* Transpose kernel: [seq, heads, hdim] -> [heads, seq, hdim] */
+__global__ void k_transpose_shd_to_hsd(float *out, const float *in,
+                                        int seq, int heads, int hdim) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = seq * heads * hdim;
+    if (idx >= total) return;
+
+    int s = idx / (heads * hdim);
+    int rem = idx % (heads * hdim);
+    int h = rem / hdim;
+    int d = rem % hdim;
+
+    /* in: [s, h, d], out: [h, s, d] */
+    int out_idx = h * seq * hdim + s * hdim + d;
+    out[out_idx] = in[idx];
+}
+
+/* Transpose kernel: [heads, seq, hdim] -> [seq, heads, hdim] */
+__global__ void k_transpose_hsd_to_shd(float *out, const float *in,
+                                        int seq, int heads, int hdim) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = seq * heads * hdim;
+    if (idx >= total) return;
+
+    int h = idx / (seq * hdim);
+    int rem = idx % (seq * hdim);
+    int s = rem / hdim;
+    int d = rem % hdim;
+
+    /* in: [h, s, d], out: [s, h, d] */
+    int out_idx = s * heads * hdim + h * hdim + d;
+    out[out_idx] = in[idx];
+}
+
+/* Softmax per row for attention scores [heads, seq_q, seq_k] */
+__global__ void k_softmax_attention(float *scores, int heads, int seq_q, int seq_k, float scale) {
+    int idx = blockIdx.x;  /* One block per row */
+    if (idx >= heads * seq_q) return;
+
+    float *row = scores + idx * seq_k;
+
+    /* Scale and find max */
+    __shared__ float smax[256];
+    float mx = -INFINITY;
+    for (int i = threadIdx.x; i < seq_k; i += blockDim.x) {
+        row[i] *= scale;
+        mx = fmaxf(mx, row[i]);
+    }
+    smax[threadIdx.x] = mx;
+    __syncthreads();
+
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (threadIdx.x < s) smax[threadIdx.x] = fmaxf(smax[threadIdx.x], smax[threadIdx.x + s]);
+        __syncthreads();
+    }
+    mx = smax[0];
+
+    /* Exp and sum */
+    __shared__ float ssum[256];
+    float sm = 0;
+    for (int i = threadIdx.x; i < seq_k; i += blockDim.x) {
+        float e = expf(row[i] - mx);
+        row[i] = e;
+        sm += e;
+    }
+    ssum[threadIdx.x] = sm;
+    __syncthreads();
+
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (threadIdx.x < s) ssum[threadIdx.x] += ssum[threadIdx.x + s];
+        __syncthreads();
+    }
+    sm = ssum[0];
+
+    /* Normalize */
+    for (int i = threadIdx.x; i < seq_k; i += blockDim.x) {
+        row[i] /= sm;
+    }
+}
+
+int flux_cuda_attention_t(int out_id, int q_id, int k_id, int v_id,
+                          int seq, int heads, int hdim, float scale) {
+    if (!g_available) return 0;
+
+    float *d_q = flux_cuda_tensor_ptr(q_id);
+    float *d_k = flux_cuda_tensor_ptr(k_id);
+    float *d_v = flux_cuda_tensor_ptr(v_id);
+    float *d_out = flux_cuda_tensor_ptr(out_id);
+    if (!d_q || !d_k || !d_v || !d_out) return 0;
+
+    size_t sz_qkv = (size_t)seq * heads * hdim * sizeof(float);
+    size_t sz_scores = (size_t)heads * seq * seq * sizeof(float);
+
+    /* Allocate transposed buffers and scores */
+    float *d_qt, *d_kt, *d_vt, *d_ot, *d_scores;
+    if (cudaMalloc(&d_qt, sz_qkv) != cudaSuccess) return 0;
+    if (cudaMalloc(&d_kt, sz_qkv) != cudaSuccess) { cudaFree(d_qt); return 0; }
+    if (cudaMalloc(&d_vt, sz_qkv) != cudaSuccess) { cudaFree(d_qt); cudaFree(d_kt); return 0; }
+    if (cudaMalloc(&d_ot, sz_qkv) != cudaSuccess) { cudaFree(d_qt); cudaFree(d_kt); cudaFree(d_vt); return 0; }
+    if (cudaMalloc(&d_scores, sz_scores) != cudaSuccess) { cudaFree(d_qt); cudaFree(d_kt); cudaFree(d_vt); cudaFree(d_ot); return 0; }
+
+    int total = seq * heads * hdim;
+
+    /* Transpose Q,K,V from [seq, heads, hdim] to [heads, seq, hdim] */
+    k_transpose_shd_to_hsd<<<(total + BLOCK_1D - 1) / BLOCK_1D, BLOCK_1D, 0, g_stream>>>(d_qt, d_q, seq, heads, hdim);
+    k_transpose_shd_to_hsd<<<(total + BLOCK_1D - 1) / BLOCK_1D, BLOCK_1D, 0, g_stream>>>(d_kt, d_k, seq, heads, hdim);
+    k_transpose_shd_to_hsd<<<(total + BLOCK_1D - 1) / BLOCK_1D, BLOCK_1D, 0, g_stream>>>(d_vt, d_v, seq, heads, hdim);
+
+    /* Batched GEMM: scores = Q @ K^T for all heads
+     * Q: [heads, seq, hdim], K: [heads, seq, hdim]
+     * scores: [heads, seq, seq]
+     * scores[h] = Q[h] @ K[h]^T
+     */
+    float alpha = 1.0f, beta = 0.0f;
+    long long strideQ = seq * hdim;
+    long long strideK = seq * hdim;
+    long long strideS = seq * seq;
+
+    cublasSgemmStridedBatched(g_cublas,
+        CUBLAS_OP_T, CUBLAS_OP_N,  /* K^T @ Q -> need to swap for row-major */
+        seq, seq, hdim,            /* m, n, k */
+        &alpha,
+        d_kt, hdim, strideK,       /* K: [hdim, seq] after transpose */
+        d_qt, hdim, strideQ,       /* Q: [hdim, seq] after transpose */
+        &beta,
+        d_scores, seq, strideS,    /* scores: [seq, seq] */
+        heads);
+
+    /* Softmax with scale */
+    k_softmax_attention<<<heads * seq, 256, 0, g_stream>>>(d_scores, heads, seq, seq, scale);
+
+    /* Batched GEMM: out = scores @ V for all heads
+     * scores: [heads, seq, seq], V: [heads, seq, hdim]
+     * out: [heads, seq, hdim]
+     */
+    long long strideV = seq * hdim;
+    long long strideO = seq * hdim;
+
+    cublasSgemmStridedBatched(g_cublas,
+        CUBLAS_OP_N, CUBLAS_OP_N,
+        hdim, seq, seq,            /* m, n, k */
+        &alpha,
+        d_vt, hdim, strideV,       /* V: [hdim, seq] */
+        d_scores, seq, strideS,    /* scores: [seq, seq] */
+        &beta,
+        d_ot, hdim, strideO,       /* out: [hdim, seq] */
+        heads);
+
+    /* Transpose output back from [heads, seq, hdim] to [seq, heads, hdim] */
+    k_transpose_hsd_to_shd<<<(total + BLOCK_1D - 1) / BLOCK_1D, BLOCK_1D, 0, g_stream>>>(d_out, d_ot, seq, heads, hdim);
+
+    cudaFree(d_qt); cudaFree(d_kt); cudaFree(d_vt); cudaFree(d_ot); cudaFree(d_scores);
+    return 1;
 }
