@@ -67,6 +67,7 @@ typedef struct {
 
 static weight_cache_entry_t g_weight_cache[WEIGHT_CACHE_SIZE];
 static int g_weight_cache_count = 0;
+static int g_weight_cache_disabled = 0;  /* Disable cache for mmap mode */
 
 static void* weight_cache_get(const void *cpu_ptr) {
     for (int i = 0; i < g_weight_cache_count; i++) {
@@ -95,7 +96,7 @@ static void* weight_cache_add(const void *cpu_ptr, size_t size) {
     return gpu_ptr;
 }
 
-static void weight_cache_clear(void) {
+void flux_cuda_weight_cache_clear(void) {
     for (int i = 0; i < g_weight_cache_count; i++) {
         if (g_weight_cache[i].gpu_ptr) cudaFree(g_weight_cache[i].gpu_ptr);
     }
@@ -103,13 +104,22 @@ static void weight_cache_clear(void) {
     memset(g_weight_cache, 0, sizeof(g_weight_cache));
 }
 
+void flux_cuda_weight_cache_disable(int disable) {
+    g_weight_cache_disabled = disable;
+    if (disable) {
+        flux_cuda_weight_cache_clear();
+    }
+}
+
 /* ========================================================================
  * Scratch Buffers - Reusable GPU memory for activations
  * ======================================================================== */
 
 static float *g_scratch_A = NULL;
+static float *g_scratch_B = NULL;  /* For weights when cache disabled */
 static float *g_scratch_C = NULL;
 static size_t g_scratch_A_size = 0;
+static size_t g_scratch_B_size = 0;
 static size_t g_scratch_C_size = 0;
 
 static float* ensure_scratch(float **buf, size_t *current, size_t needed) {
@@ -126,6 +136,7 @@ static float* ensure_scratch(float **buf, size_t *current, size_t needed) {
 
 static void free_scratch(void) {
     if (g_scratch_A) { cudaFree(g_scratch_A); g_scratch_A = NULL; g_scratch_A_size = 0; }
+    if (g_scratch_B) { cudaFree(g_scratch_B); g_scratch_B = NULL; g_scratch_B_size = 0; }
     if (g_scratch_C) { cudaFree(g_scratch_C); g_scratch_C = NULL; g_scratch_C_size = 0; }
 }
 
@@ -259,7 +270,7 @@ int flux_cuda_compute_capability(void) { return g_compute_cap; }
 int flux_cuda_kernels_available(void) { return g_available; }
 
 void flux_cuda_cleanup(void) {
-    weight_cache_clear();
+    flux_cuda_weight_cache_clear();
     free_scratch();
     free_tensor_pool();
     if (g_stream) { cudaStreamDestroy(g_stream); g_stream = NULL; }
@@ -586,11 +597,18 @@ void flux_cuda_sgemm(int ta, int tb, int M, int N, int K,
     if (!dA) return;
     CUDA_CHECK(cudaMemcpyAsync(dA, A, szA, cudaMemcpyHostToDevice, g_stream));
 
-    /* B = weights, check cache first */
-    float *dB = (float*)weight_cache_get(B);
-    if (!dB) {
-        dB = (float*)weight_cache_add(B, szB);
-        if (!dB) return;  /* Cache full and can't allocate */
+    /* B = weights - use cache if enabled, scratch buffer otherwise */
+    float *dB;
+    if (g_weight_cache_disabled) {
+        dB = ensure_scratch(&g_scratch_B, &g_scratch_B_size, szB);
+        if (!dB) return;
+        CUDA_CHECK(cudaMemcpyAsync(dB, B, szB, cudaMemcpyHostToDevice, g_stream));
+    } else {
+        dB = (float*)weight_cache_get(B);
+        if (!dB) {
+            dB = (float*)weight_cache_add(B, szB);
+            if (!dB) return;  /* Cache full and can't allocate */
+        }
     }
 
     /* C = output, use scratch buffer */
@@ -619,12 +637,20 @@ int flux_cuda_sgemm_gpu(int ta, int tb, int M, int N, int K,
     float *dC = flux_cuda_tensor_ptr(C_id);
     if (!dA || !dC) return -1;
 
-    /* B = weights, check cache */
+    /* B = weights - use cache if enabled, scratch buffer otherwise */
     size_t szB = (size_t)(tb ? N * K : K * N) * sizeof(float);
-    float *dB = (float*)weight_cache_get(B);
-    if (!dB) {
-        dB = (float*)weight_cache_add(B, szB);
+    float *dB;
+    if (g_weight_cache_disabled) {
+        dB = ensure_scratch(&g_scratch_B, &g_scratch_B_size, szB);
         if (!dB) return -1;
+        cudaError_t e = cudaMemcpyAsync(dB, B, szB, cudaMemcpyHostToDevice, g_stream);
+        if (e != cudaSuccess) return -1;
+    } else {
+        dB = (float*)weight_cache_get(B);
+        if (!dB) {
+            dB = (float*)weight_cache_add(B, szB);
+            if (!dB) return -1;
+        }
     }
 
     cublasOperation_t opA = ta ? CUBLAS_OP_T : CUBLAS_OP_N;
