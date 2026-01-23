@@ -1282,6 +1282,53 @@ static void joint_attention(float *img_out, float *txt_out,
     memcpy(cat_k + txt_seq * hidden, img_k, img_seq * hidden * sizeof(float));
     memcpy(cat_v + txt_seq * hidden, img_v, img_seq * hidden * sizeof(float));
 
+#ifdef USE_CUDA
+    /* Try CUDA joint attention - upload data to GPU tensors */
+    if (flux_cuda_available()) {
+        size_t sz_img = img_seq * hidden * sizeof(float);
+        size_t sz_txt = txt_seq * hidden * sizeof(float);
+        size_t sz_cat = total_seq * hidden * sizeof(float);
+
+        int t_img_q = flux_cuda_tensor_get(sz_img);
+        int t_txt_q = flux_cuda_tensor_get(sz_txt);
+        int t_cat_k = flux_cuda_tensor_get(sz_cat);
+        int t_cat_v = flux_cuda_tensor_get(sz_cat);
+        int t_img_out = flux_cuda_tensor_get(sz_img);
+        int t_txt_out = flux_cuda_tensor_get(sz_txt);
+
+        if (t_img_q >= 0 && t_txt_q >= 0 && t_cat_k >= 0 && t_cat_v >= 0 &&
+            t_img_out >= 0 && t_txt_out >= 0) {
+            flux_cuda_tensor_upload(t_img_q, img_q, sz_img);
+            flux_cuda_tensor_upload(t_txt_q, txt_q, sz_txt);
+            flux_cuda_tensor_upload(t_cat_k, cat_k, sz_cat);
+            flux_cuda_tensor_upload(t_cat_v, cat_v, sz_cat);
+
+            if (flux_cuda_joint_attention_t(t_img_out, t_txt_out,
+                                            t_img_q, t_txt_q,
+                                            t_cat_k, t_cat_v,
+                                            img_seq, txt_seq, heads, head_dim, scale)) {
+                flux_cuda_tensor_download(t_img_out, img_out, sz_img);
+                flux_cuda_tensor_download(t_txt_out, txt_out, sz_txt);
+                flux_cuda_sync();
+
+                flux_cuda_tensor_release(t_img_q);
+                flux_cuda_tensor_release(t_txt_q);
+                flux_cuda_tensor_release(t_cat_k);
+                flux_cuda_tensor_release(t_cat_v);
+                flux_cuda_tensor_release(t_img_out);
+                flux_cuda_tensor_release(t_txt_out);
+                return;
+            }
+        }
+        flux_cuda_tensor_release(t_img_q);
+        flux_cuda_tensor_release(t_txt_q);
+        flux_cuda_tensor_release(t_cat_k);
+        flux_cuda_tensor_release(t_cat_v);
+        flux_cuda_tensor_release(t_img_out);
+        flux_cuda_tensor_release(t_txt_out);
+    }
+#endif
+
 #ifdef USE_METAL
     /* Try fused attention kernel first - operates directly on [seq, hidden] layout
      * This avoids CPU transpose overhead */
