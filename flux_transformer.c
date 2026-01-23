@@ -2700,11 +2700,10 @@ static int single_block_forward_cuda(float *hidden, const single_block_t *block,
     flux_cuda_qk_norm_t(t_q, t_k, block->norm_q_weight, block->norm_k_weight,
                         seq, heads, head_dim, eps);
 
-    /* RoPE + Attention (CPU fallback for now) */
-    float *q_cpu = tf->single_q, *k_cpu = tf->single_k, *v_cpu = tf->single_v;
+    /* RoPE on CPU (need to download Q,K for RoPE, then try GPU attention) */
+    float *q_cpu = tf->single_q, *k_cpu = tf->single_k;
     flux_cuda_tensor_download(t_q, q_cpu, sz_h);
     flux_cuda_tensor_download(t_k, k_cpu, sz_h);
-    flux_cuda_tensor_download(t_v, v_cpu, sz_h);
     flux_cuda_sync();
 
     apply_rope_2d(q_cpu, txt_rope_cos, txt_rope_sin, txt_seq, heads, head_dim, axis_dim);
@@ -2712,9 +2711,21 @@ static int single_block_forward_cuda(float *hidden, const single_block_t *block,
     apply_rope_2d(q_cpu + txt_seq * h, img_rope_cos, img_rope_sin, img_seq, heads, head_dim, axis_dim);
     apply_rope_2d(k_cpu + txt_seq * h, img_rope_cos, img_rope_sin, img_seq, heads, head_dim, axis_dim);
 
-    float *attn_cpu = tf->single_attn_out;
-    mha_forward(attn_cpu, q_cpu, k_cpu, v_cpu, seq, heads, head_dim, tf);
-    flux_cuda_tensor_upload(t_attn, attn_cpu, sz_h);
+    /* Re-upload Q,K after RoPE */
+    flux_cuda_tensor_upload(t_q, q_cpu, sz_h);
+    flux_cuda_tensor_upload(t_k, k_cpu, sz_h);
+
+    /* GPU attention with batched cuBLAS */
+    float attn_scale = 1.0f / sqrtf((float)head_dim);
+    if (!flux_cuda_attention_t(t_attn, t_q, t_k, t_v, seq, heads, head_dim, attn_scale)) {
+        /* Fallback to CPU attention */
+        float *v_cpu = tf->single_v;
+        float *attn_cpu = tf->single_attn_out;
+        flux_cuda_tensor_download(t_v, v_cpu, sz_h);
+        flux_cuda_sync();
+        mha_forward(attn_cpu, q_cpu, k_cpu, v_cpu, seq, heads, head_dim, tf);
+        flux_cuda_tensor_upload(t_attn, attn_cpu, sz_h);
+    }
 
     /* SwiGLU + concat + proj on GPU */
     flux_cuda_silu_t(t_gate, seq * mlp);
