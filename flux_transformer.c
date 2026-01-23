@@ -1842,28 +1842,11 @@ static int double_block_forward_cuda(float *img_hidden, float *txt_hidden,
     flux_cuda_sgemm_gpu(0, 1, txt_seq, h, h, 1.0f, t_txt_norm, h, block->txt_v_weight, h, 0.0f, t_txt_v, h);
     flux_cuda_qk_norm_t(t_txt_q, t_txt_k, block->txt_norm_q_weight, block->txt_norm_k_weight, txt_seq, heads, head_dim, eps);
 
-    /* === Phase 6: RoPE on CPU (download, apply, re-upload) === */
-    float *img_q_cpu = tf->work2;
-    float *img_k_cpu = img_q_cpu + img_seq * h;
-    float *txt_q_cpu = tf->work2 + (img_seq * 2) * h;
-    float *txt_k_cpu = txt_q_cpu + txt_seq * h;
-
-    flux_cuda_tensor_download(t_img_q, img_q_cpu, sz_img);
-    flux_cuda_tensor_download(t_img_k, img_k_cpu, sz_img);
-    flux_cuda_tensor_download(t_txt_q, txt_q_cpu, sz_txt);
-    flux_cuda_tensor_download(t_txt_k, txt_k_cpu, sz_txt);
-    flux_cuda_sync();
-
-    int axis_dim = 32;
-    apply_rope_2d(img_q_cpu, img_rope_cos, img_rope_sin, img_seq, heads, head_dim, axis_dim);
-    apply_rope_2d(img_k_cpu, img_rope_cos, img_rope_sin, img_seq, heads, head_dim, axis_dim);
-    apply_rope_2d(txt_q_cpu, txt_rope_cos, txt_rope_sin, txt_seq, heads, head_dim, axis_dim);
-    apply_rope_2d(txt_k_cpu, txt_rope_cos, txt_rope_sin, txt_seq, heads, head_dim, axis_dim);
-
-    flux_cuda_tensor_upload(t_img_q, img_q_cpu, sz_img);
-    flux_cuda_tensor_upload(t_img_k, img_k_cpu, sz_img);
-    flux_cuda_tensor_upload(t_txt_q, txt_q_cpu, sz_txt);
-    flux_cuda_tensor_upload(t_txt_k, txt_k_cpu, sz_txt);
+    /* === Phase 6: RoPE on GPU === */
+    flux_cuda_rope_2d_full_t(t_img_q, img_rope_cos, img_rope_sin, img_seq, heads, head_dim);
+    flux_cuda_rope_2d_full_t(t_img_k, img_rope_cos, img_rope_sin, img_seq, heads, head_dim);
+    flux_cuda_rope_2d_full_t(t_txt_q, txt_rope_cos, txt_rope_sin, txt_seq, heads, head_dim);
+    flux_cuda_rope_2d_full_t(t_txt_k, txt_rope_cos, txt_rope_sin, txt_seq, heads, head_dim);
 
     /* === Phase 7: Concat K,V and joint attention === */
     /* cat_k = [txt_k, img_k], cat_v = [txt_v, img_v] */
@@ -3248,27 +3231,22 @@ static int single_block_forward_cuda(float *hidden, const single_block_t *block,
     flux_cuda_qk_norm_t(t_q, t_k, block->norm_q_weight, block->norm_k_weight,
                         seq, heads, head_dim, eps);
 
-    /* RoPE on CPU (need to download Q,K for RoPE, then try GPU attention) */
-    float *q_cpu = tf->single_q, *k_cpu = tf->single_k;
-    flux_cuda_tensor_download(t_q, q_cpu, sz_h);
-    flux_cuda_tensor_download(t_k, k_cpu, sz_h);
-    flux_cuda_sync();
-
-    apply_rope_2d(q_cpu, txt_rope_cos, txt_rope_sin, txt_seq, heads, head_dim, axis_dim);
-    apply_rope_2d(k_cpu, txt_rope_cos, txt_rope_sin, txt_seq, heads, head_dim, axis_dim);
-    apply_rope_2d(q_cpu + txt_seq * h, img_rope_cos, img_rope_sin, img_seq, heads, head_dim, axis_dim);
-    apply_rope_2d(k_cpu + txt_seq * h, img_rope_cos, img_rope_sin, img_seq, heads, head_dim, axis_dim);
-
-    /* Re-upload Q,K after RoPE */
-    flux_cuda_tensor_upload(t_q, q_cpu, sz_h);
-    flux_cuda_tensor_upload(t_k, k_cpu, sz_h);
+    /* RoPE on GPU - apply to txt portion (offset 0) and img portion (offset txt_seq) */
+    flux_cuda_rope_offset_t(t_q, txt_rope_cos, txt_rope_sin, txt_seq, 0, heads, head_dim, axis_dim);
+    flux_cuda_rope_offset_t(t_k, txt_rope_cos, txt_rope_sin, txt_seq, 0, heads, head_dim, axis_dim);
+    flux_cuda_rope_offset_t(t_q, img_rope_cos, img_rope_sin, img_seq, txt_seq, heads, head_dim, axis_dim);
+    flux_cuda_rope_offset_t(t_k, img_rope_cos, img_rope_sin, img_seq, txt_seq, heads, head_dim, axis_dim);
 
     /* GPU attention with batched cuBLAS */
     float attn_scale = 1.0f / sqrtf((float)head_dim);
     if (!flux_cuda_attention_t(t_attn, t_q, t_k, t_v, seq, heads, head_dim, attn_scale)) {
-        /* Fallback to CPU attention */
+        /* Fallback to CPU attention - need to download Q,K,V */
+        float *q_cpu = tf->single_q;
+        float *k_cpu = tf->single_k;
         float *v_cpu = tf->single_v;
         float *attn_cpu = tf->single_attn_out;
+        flux_cuda_tensor_download(t_q, q_cpu, sz_h);
+        flux_cuda_tensor_download(t_k, k_cpu, sz_h);
         flux_cuda_tensor_download(t_v, v_cpu, sz_h);
         flux_cuda_sync();
         mha_forward(attn_cpu, q_cpu, k_cpu, v_cpu, seq, heads, head_dim, tf);
