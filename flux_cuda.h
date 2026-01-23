@@ -293,6 +293,9 @@ void flux_cuda_adaln_t(int out_id, int x_id, const float *shift, const float *sc
                        int seq, int hid, float eps);
 void flux_cuda_qk_norm_t(int q_id, int k_id, const float *qw, const float *kw,
                          int seq, int heads, int hdim, float eps);
+/* RoPE 2D full head_dim version - uses tensor pool */
+void flux_cuda_rope_2d_full_t(int x_id, const float *cos_f, const float *sin_f,
+                               int seq, int heads, int hdim);
 void flux_cuda_rope_t(int x_id, const float *cos_f, const float *sin_f,
                       int seq, int heads, int hdim, int axis_dim);
 void flux_cuda_rope_offset_t(int x_id, const float *cos_f, const float *sin_f,
