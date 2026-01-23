@@ -3224,9 +3224,7 @@ float *flux_transformer_forward(flux_transformer_t *tf,
         /* Try CUDA-optimized path first */
         if (!double_block_forward_cuda(img_hidden, txt_hidden,
                              &tf->double_blocks[i],
-                             t_emb,
-                             tf->adaln_double_img_weight,
-                             tf->adaln_double_txt_weight,
+                             tf->double_mod_img, tf->double_mod_txt,
                              img_rope_cos, img_rope_sin,
                              txt_rope_cos, txt_rope_sin,
                              img_seq, txt_seq, tf))
@@ -4643,6 +4641,12 @@ flux_transformer_t *flux_transformer_load_safetensors_mmap(safetensors_file_t *s
     /* Enable mmap mode - keep sf open, don't load block weights yet */
     tf->use_mmap = 1;
     tf->sf = sf;
+
+#ifdef USE_CUDA
+    /* Disable weight cache in mmap mode - weights are loaded/freed per block,
+     * so CPU addresses can be reused for different weights. */
+    flux_cuda_weight_cache_disable(1);
+#endif
 
     /* Enable bf16 mode if Metal GPU is available */
 #ifdef USE_METAL

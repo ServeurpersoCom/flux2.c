@@ -314,6 +314,18 @@ int flux_cuda_joint_attention_t(int img_out_id, int txt_out_id,
                                  int cat_k_id, int cat_v_id,
                                  int img_seq, int txt_seq, int heads, int hdim, float scale);
 
+/*
+ * Clear the GPU weight cache.
+ * Must be called when weights are freed/reallocated (mmap mode).
+ */
+void flux_cuda_weight_cache_clear(void);
+
+/*
+ * Disable/enable the GPU weight cache.
+ * Call with disable=1 for mmap mode (weights change addresses).
+ */
+void flux_cuda_weight_cache_disable(int disable);
+
 #ifdef __cplusplus
 }
 #endif
