@@ -21,7 +21,7 @@ import numpy as np
 from PIL import Image
 
 # Test cases: same as run_test.py but with higher tolerance for GPU precision differences
-# Empirically determined: CUDA produces max_diff of 5-9 vs BLAS references
+# Empirically determined: CUDA produces max_diff of 20-30 vs references
 # due to TF32 precision and different floating-point operation ordering
 TESTS = [
     {
@@ -32,7 +32,7 @@ TESTS = [
         "width": 64,
         "height": 64,
         "reference": "test_vectors/reference_2step_64x64_seed42.png",
-        "max_diff": 50,  # CUDA: observed max_diff=5, allow headroom
+        "max_diff": 20,  # CUDA: observed max_diff=16, allow headroom
     },
     {
         "name": "512x512 full test (4 steps)",
@@ -42,7 +42,7 @@ TESTS = [
         "width": 512,
         "height": 512,
         "reference": "test_vectors/reference_4step_512x512_seed123.png",
-        "max_diff": 50,  # CUDA: observed max_diff=9, allow headroom
+        "max_diff": 30,  # CUDA: observed max_diff=26, allow headroom
     },
 ]
 
