@@ -96,7 +96,7 @@ static void* weight_cache_add(const void *cpu_ptr, size_t size) {
     return gpu_ptr;
 }
 
-void flux_cuda_weight_cache_clear(void) {
+static void flux_cuda_weight_cache_clear(void) {
     for (int i = 0; i < g_weight_cache_count; i++) {
         if (g_weight_cache[i].gpu_ptr) cudaFree(g_weight_cache[i].gpu_ptr);
     }
@@ -150,15 +150,6 @@ static uint16_t* ensure_scratch_bf16(size_t needed) {
     }
     g_scratch_bf16_size = needed;
     return g_scratch_bf16;
-}
-
-static void free_scratch(void) {
-    if (g_scratch_A) { cudaFree(g_scratch_A); g_scratch_A = NULL; g_scratch_A_size = 0; }
-    if (g_scratch_B) { cudaFree(g_scratch_B); g_scratch_B = NULL; g_scratch_B_size = 0; }
-    if (g_scratch_C) { cudaFree(g_scratch_C); g_scratch_C = NULL; g_scratch_C_size = 0; }
-    if (g_scratch_small1) { cudaFree(g_scratch_small1); g_scratch_small1 = NULL; g_scratch_small1_size = 0; }
-    if (g_scratch_small2) { cudaFree(g_scratch_small2); g_scratch_small2 = NULL; g_scratch_small2_size = 0; }
-    if (g_scratch_bf16) { cudaFree(g_scratch_bf16); g_scratch_bf16 = NULL; g_scratch_bf16_size = 0; }
 }
 
 /* ========================================================================
@@ -230,17 +221,6 @@ void flux_cuda_memcpy_d2d(int dst_id, size_t dst_offset, int src_id, size_t src_
     cudaMemcpyAsync(dst, src, size, cudaMemcpyDeviceToDevice, g_stream);
 }
 
-static void free_tensor_pool(void) {
-    for (int i = 0; i < GPU_TENSOR_POOL_SIZE; i++) {
-        if (g_tensor_pool[i].ptr) {
-            cudaFree(g_tensor_pool[i].ptr);
-            g_tensor_pool[i].ptr = NULL;
-            g_tensor_pool[i].size = 0;
-            g_tensor_pool[i].in_use = 0;
-        }
-    }
-}
-
 /* ========================================================================
  * Kernel Constants
  * ======================================================================== */
@@ -288,22 +268,6 @@ int flux_cuda_init(void) {
 
 int flux_cuda_available(void) { return g_available; }
 const char* flux_cuda_device_name(void) { return g_device_name; }
-int flux_cuda_compute_capability(void) { return g_compute_cap; }
-int flux_cuda_kernels_available(void) { return g_available; }
-
-void flux_cuda_cleanup(void) {
-    flux_cuda_weight_cache_clear();
-    free_scratch();
-    free_tensor_pool();
-    if (g_stream) { cudaStreamDestroy(g_stream); g_stream = NULL; }
-    if (g_cublas) { cublasDestroy(g_cublas); g_cublas = NULL; }
-    g_available = 0;
-    g_initialized = 0;
-}
-
-void flux_cuda_reset(void) {
-    if (g_available) cudaStreamSynchronize(g_stream);
-}
 
 void flux_cuda_sync(void) {
     if (g_available) cudaStreamSynchronize(g_stream);
@@ -334,28 +298,9 @@ __global__ void k_silu_mul(float *gate, const float *up, int n) {
     }
 }
 
-__global__ void k_gelu(float *x, int n) {
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < n) {
-        float v = x[i];
-        float inner = 0.7978845608f * (v + 0.044715f * v * v * v);
-        x[i] = 0.5f * v * (1.0f + tanhf(inner));
-    }
-}
-
-__global__ void k_add(float *a, const float *b, int n) {
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < n) a[i] += b[i];
-}
-
 __global__ void k_mul(float *a, const float *b, int n) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) a[i] *= b[i];
-}
-
-__global__ void k_scale(float *a, float s, int n) {
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < n) a[i] *= s;
 }
 
 /* Gated residual: out[i] += gate[i % hidden] * x[i] */
@@ -791,17 +736,6 @@ void flux_cuda_sgemm_bf16(int ta, int tb, int M, int N, int K,
     free(B_f32);
 }
 
-void flux_cuda_sgemm_batch(int ta, int tb, int M, int N, int K,
-                           float alpha, const float *A, int lda, int strideA,
-                           const float *B, int ldb, int strideB,
-                           float beta, float *C, int ldc, int strideC, int batch) {
-    for (int b = 0; b < batch; b++) {
-        flux_cuda_sgemm(ta, tb, M, N, K, alpha,
-                        A + b * strideA, lda, B + b * strideB, ldb,
-                        beta, C + b * strideC, ldc);
-    }
-}
-
 /* ========================================================================
  * GPU Tensor Operations - Work on tensors already on GPU
  * ======================================================================== */
@@ -922,33 +856,6 @@ void flux_cuda_rope_2d_full_t(int x_id, const float *cos_f, const float *sin_f,
     int total = seq * heads * (hdim / 2);
     k_rope_2d_offset<<<(total + BLOCK_1D - 1) / BLOCK_1D, BLOCK_1D, 0, g_stream>>>(
         d_x, d_c, d_s, seq, 0, heads, hdim, hdim);
-
-    flux_cuda_tensor_release(t_c);
-    flux_cuda_tensor_release(t_s);
-}
-
-void flux_cuda_rope_t(int x_id, const float *cos_f, const float *sin_f,
-                      int seq, int heads, int hdim, int axis_dim) {
-    if (!g_available) return;
-    float *d_x = flux_cuda_tensor_ptr(x_id);
-    if (!d_x) return;
-
-    size_t szf = (size_t)seq * (axis_dim / 2) * sizeof(float);
-    int t_c = flux_cuda_tensor_get(szf);
-    int t_s = flux_cuda_tensor_get(szf);
-    if (t_c < 0 || t_s < 0) {
-        flux_cuda_tensor_release(t_c);
-        flux_cuda_tensor_release(t_s);
-        return;
-    }
-
-    float *d_c = flux_cuda_tensor_ptr(t_c);
-    float *d_s = flux_cuda_tensor_ptr(t_s);
-    cudaMemcpyAsync(d_c, cos_f, szf, cudaMemcpyHostToDevice, g_stream);
-    cudaMemcpyAsync(d_s, sin_f, szf, cudaMemcpyHostToDevice, g_stream);
-
-    int total = seq * heads * (axis_dim / 2);
-    k_rope_2d<<<(total + BLOCK_1D - 1) / BLOCK_1D, BLOCK_1D, 0, g_stream>>>(d_x, d_c, d_s, seq, heads, hdim, axis_dim);
 
     flux_cuda_tensor_release(t_c);
     flux_cuda_tensor_release(t_s);
@@ -1104,13 +1011,6 @@ int flux_cuda_conv2d(float *out, const float *in, const float *weight, const flo
     cudaFree(d_in); cudaFree(d_out); cudaFree(d_col); cudaFree(d_weight);
     if (d_bias) cudaFree(d_bias);
     return 1;
-}
-
-int flux_cuda_attention_fused(float *out, const float *Q, const float *K, const float *V,
-                              int seq_q, int seq_k, int num_heads, int head_dim, float scale) {
-    (void)out; (void)Q; (void)K; (void)V;
-    (void)seq_q; (void)seq_k; (void)num_heads; (void)head_dim; (void)scale;
-    return 0;  /* Fall back to CPU */
 }
 
 /* Causal softmax kernel with attention mask */
