@@ -4718,7 +4718,7 @@ static uint16_t *get_sf_tensor_bf16(safetensors_file_t *sf, const char *name) {
 }
 
 #ifdef USE_METAL
-/* Warm up bf16→f16 cache for all weight tensors.
+/* Warm up bf16->f16 cache for all weight tensors.
  * This converts bf16 weights to f16 during model loading so it doesn't happen
  * during the first inference step. This shifts ~5s of warmup from first step
  * to model loading, resulting in consistent per-step timing.
@@ -5037,7 +5037,7 @@ flux_transformer_t *flux_transformer_load_safetensors(safetensors_file_t *sf) {
     }
 
 #ifdef USE_METAL
-    /* Pre-warm bf16→f16 cache to avoid conversion overhead on first inference step */
+    /* Pre-warm bf16->f16 cache to avoid conversion overhead on first inference step */
     warmup_bf16_weights(tf);
 #endif
 
