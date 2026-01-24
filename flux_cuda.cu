@@ -258,7 +258,8 @@ int flux_cuda_init(void) {
     }
 
     cublasSetStream(g_cublas, g_stream);
-    if (g_compute_cap >= 70) cublasSetMathMode(g_cublas, CUBLAS_TF32_TENSOR_OP_MATH);
+    /* TF32 only available on Ampere (sm_80) and newer, not Turing (sm_75) */
+    if (g_compute_cap >= 80) cublasSetMathMode(g_cublas, CUBLAS_TF32_TENSOR_OP_MATH);
 
     g_available = 1;
     return 1;

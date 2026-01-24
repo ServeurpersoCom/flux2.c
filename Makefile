@@ -128,9 +128,18 @@ CUDA_CFLAGS = $(CFLAGS_BASE) -DUSE_CUDA -DUSE_BLAS -I$(CUDA_PATH)/include
 CUDA_NVCCFLAGS = -O3 -use_fast_math --compiler-options "$(CFLAGS_BASE)"
 CUDA_LDFLAGS = $(LDFLAGS) -L$(CUDA_PATH)/lib64 -lcudart -lcublas -lopenblas -lstdc++
 
-# Auto-detect GPU architecture (default to common ones if detection fails)
-CUDA_ARCH ?= sm_120
-CUDA_NVCCFLAGS += -arch=$(CUDA_ARCH)
+# Auto-detect GPU architecture from installed GPU, fallback to multi-arch fat binary
+DETECTED_COMPUTE := $(shell nvidia-smi --query-gpu=compute_cap --format=csv,noheader 2>/dev/null | head -1 | tr -d '.')
+ifneq ($(DETECTED_COMPUTE),)
+    CUDA_ARCH ?= sm_$(DETECTED_COMPUTE)
+    CUDA_NVCCFLAGS += -arch=$(CUDA_ARCH)
+else
+    # Fat binary: Turing (RTX 2080), Ampere (RTX 3090), Ada (RTX 4090), Blackwell (RTX 5090)
+    CUDA_NVCCFLAGS += -gencode arch=compute_75,code=sm_75 \
+                      -gencode arch=compute_86,code=sm_86 \
+                      -gencode arch=compute_89,code=sm_89 \
+                      -gencode arch=compute_120,code=sm_120
+endif
 
 cuda: clean cuda-build
 	@echo ""
