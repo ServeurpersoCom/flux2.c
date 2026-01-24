@@ -30,17 +30,6 @@ int flux_cuda_init(void);
 int flux_cuda_available(void);
 
 /*
- * Cleanup CUDA resources.
- */
-void flux_cuda_cleanup(void);
-
-/*
- * Reset all GPU state (caches, pools, pending commands).
- * Call this between independent inference phases.
- */
-void flux_cuda_reset(void);
-
-/*
  * GPU-accelerated matrix multiplication using cuBLAS.
  * C[M,N] = alpha * A[M,K] @ B[K,N] + beta * C[M,N]
  *
@@ -81,19 +70,6 @@ int flux_cuda_conv2d(float *out, const float *in,
                      int stride, int padding);
 
 /*
- * Batch matrix multiplication on GPU.
- * Performs batch_count independent matrix multiplications.
- */
-void flux_cuda_sgemm_batch(int transpose_a, int transpose_b,
-                           int M, int N, int K,
-                           float alpha,
-                           const float *A, int lda, int stride_a,
-                           const float *B, int ldb, int stride_b,
-                           float beta,
-                           float *C, int ldc, int stride_c,
-                           int batch_count);
-
-/*
  * Synchronize GPU operations (wait for completion).
  */
 void flux_cuda_sync(void);
@@ -121,21 +97,6 @@ int flux_cuda_in_batch(void);
 size_t flux_cuda_memory_used(void);
 
 /*
- * Fused attention on GPU.
- * Computes attention for all heads in a single GPU batch.
- *
- * Q, K, V are in [seq, heads*head_dim] layout
- * out: [seq_q, heads * head_dim]
- *
- * This does: out = softmax(Q @ K^T * scale) @ V
- * Returns 1 on success, 0 on failure (falls back to CPU).
- */
-int flux_cuda_attention_fused(float *out,
-                              const float *Q, const float *K, const float *V,
-                              int seq_q, int seq_k, int num_heads, int head_dim,
-                              float scale);
-
-/*
  * GPU-accelerated causal attention for text encoder.
  * Supports GQA (Grouped Query Attention).
  * Returns 1 on success, 0 on failure.
@@ -147,19 +108,9 @@ int flux_cuda_causal_attention(float *out,
                                int head_dim, float scale);
 
 /*
- * Check if compute kernels are available.
- */
-int flux_cuda_kernels_available(void);
-
-/*
  * Get CUDA device name for display.
  */
 const char* flux_cuda_device_name(void);
-
-/*
- * Get CUDA compute capability.
- */
-int flux_cuda_compute_capability(void);
 
 /* ========================================================================
  * GPU Tensor Pool - Keep data on GPU between operations
@@ -225,8 +176,6 @@ void flux_cuda_qk_norm_t(int q_id, int k_id, const float *qw, const float *kw,
 /* RoPE 2D full head_dim version - uses tensor pool */
 void flux_cuda_rope_2d_full_t(int x_id, const float *cos_f, const float *sin_f,
                                int seq, int heads, int hdim);
-void flux_cuda_rope_t(int x_id, const float *cos_f, const float *sin_f,
-                      int seq, int heads, int hdim, int axis_dim);
 void flux_cuda_rope_offset_t(int x_id, const float *cos_f, const float *sin_f,
                               int seq_len, int seq_offset, int heads, int hdim, int axis_dim);
 
@@ -242,12 +191,6 @@ int flux_cuda_joint_attention_t(int img_out_id, int txt_out_id,
                                  int img_q_id, int txt_q_id,
                                  int cat_k_id, int cat_v_id,
                                  int img_seq, int txt_seq, int heads, int hdim, float scale);
-
-/*
- * Clear the GPU weight cache.
- * Must be called when weights are freed/reallocated (mmap mode).
- */
-void flux_cuda_weight_cache_clear(void);
 
 /*
  * Disable/enable the GPU weight cache.
