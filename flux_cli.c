@@ -663,18 +663,11 @@ static int process_prompt(char *line) {
 
     while (*line == '$') {
         line++;  /* skip $ */
-        char *end;
-        long id = strtol(line, &end, 10);
-        if (end == line) {
-            /* Just $ without number - use last image */
-            if (state.last_image[0] == '\0') {
-                fprintf(stderr, "Error: No image for img2img. "
-                                "Generate or !load an image first.\n");
-                return 0;
-            }
-            ref_paths[num_refs++] = state.last_image;
-        } else {
-            /* $N - lookup reference */
+        /* $N requires digit immediately after $ (no spaces) */
+        if (isdigit((unsigned char)*line)) {
+            /* $N - parse number and lookup reference */
+            char *end;
+            long id = strtol(line, &end, 10);
             const char *path = ref_lookup((int)id);
             if (!path) {
                 fprintf(stderr, "Error: Reference $%ld not found.\n", id);
@@ -682,6 +675,14 @@ static int process_prompt(char *line) {
             }
             ref_paths[num_refs++] = path;
             line = end;
+        } else {
+            /* Just $ (followed by space or other) - use last image */
+            if (state.last_image[0] == '\0') {
+                fprintf(stderr, "Error: No image for img2img. "
+                                "Generate or !load an image first.\n");
+                return 0;
+            }
+            ref_paths[num_refs++] = state.last_image;
         }
         line = skip_spaces(line);
         if (num_refs >= CLI_MAX_REFS) break;
