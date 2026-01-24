@@ -2842,8 +2842,9 @@ static int single_block_forward_cuda(float *hidden, const single_block_t *block,
                                      const float *txt_rope_cos, const float *txt_rope_sin,
                                      int seq, int img_offset, flux_transformer_t *tf) {
     if (!flux_cuda_available()) return 0;
-    /* Need f32 weights - fall back to CPU for bf16 */
-    if (!block->qkv_mlp_weight || !block->proj_mlp_weight) return 0;
+    /* Support both f32 and bf16 weights */
+    int use_bf16 = (block->qkv_mlp_weight_bf16 && block->proj_mlp_weight_bf16);
+    if (!use_bf16 && (!block->qkv_mlp_weight || !block->proj_mlp_weight)) return 0;
 
     int h = tf->hidden_size;
     int heads = tf->num_heads;
@@ -2903,8 +2904,13 @@ static int single_block_forward_cuda(float *hidden, const single_block_t *block,
     flux_cuda_adaln_t(t_norm, t_hidden, shift, scale, seq, h, eps);
 
     /* Fused QKV+MLP projection */
-    flux_cuda_sgemm_gpu(0, 1, seq, fused_dim, h, 1.0f, t_norm, h,
-                        block->qkv_mlp_weight, h, 0.0f, t_fused, fused_dim);
+    if (use_bf16) {
+        flux_cuda_sgemm_gpu_bf16(0, 1, seq, fused_dim, h, 1.0f, t_norm, h,
+                                 block->qkv_mlp_weight_bf16, h, 0.0f, t_fused, fused_dim);
+    } else {
+        flux_cuda_sgemm_gpu(0, 1, seq, fused_dim, h, 1.0f, t_norm, h,
+                            block->qkv_mlp_weight, h, 0.0f, t_fused, fused_dim);
+    }
     flux_cuda_split_fused_t(t_fused, t_q, t_k, t_v, t_gate, t_up, seq, h, mlp);
     flux_cuda_qk_norm_t(t_q, t_k, block->norm_q_weight, block->norm_k_weight,
                         seq, heads, head_dim, eps);
@@ -2936,8 +2942,13 @@ static int single_block_forward_cuda(float *hidden, const single_block_t *block,
     flux_cuda_mul_t(t_gate, t_up, seq * mlp);
     flux_cuda_concat_t(t_concat, t_attn, t_gate, seq, h, mlp);
 
-    flux_cuda_sgemm_gpu(0, 1, seq, h, h + mlp, 1.0f, t_concat, h + mlp,
-                        block->proj_mlp_weight, h + mlp, 0.0f, t_proj, h);
+    if (use_bf16) {
+        flux_cuda_sgemm_gpu_bf16(0, 1, seq, h, h + mlp, 1.0f, t_concat, h + mlp,
+                                 block->proj_mlp_weight_bf16, h + mlp, 0.0f, t_proj, h);
+    } else {
+        flux_cuda_sgemm_gpu(0, 1, seq, h, h + mlp, 1.0f, t_concat, h + mlp,
+                            block->proj_mlp_weight, h + mlp, 0.0f, t_proj, h);
+    }
     flux_cuda_gated_add_t(t_hidden, gate, t_proj, seq, h);
 
     flux_cuda_tensor_download(t_hidden, hidden, sz_h);
@@ -4399,11 +4410,16 @@ flux_transformer_t *flux_transformer_load_safetensors(safetensors_file_t *sf) {
     tf->rope_dim = 128;
     tf->rope_theta = 2000.0f;
 
-    /* Enable bf16 mode if Metal GPU is available */
+    /* Enable bf16 mode if Metal or CUDA GPU is available */
 #ifdef USE_METAL
     tf->use_bf16 = flux_metal_available();
     if (tf->use_bf16) {
         printf("Using bf16 weights for GPU acceleration\n");
+    }
+#elif defined(USE_CUDA)
+    tf->use_bf16 = flux_cuda_available();
+    if (tf->use_bf16) {
+        printf("Using bf16 weights for CUDA GPU acceleration\n");
     }
 #else
     tf->use_bf16 = 0;
@@ -4648,11 +4664,16 @@ flux_transformer_t *flux_transformer_load_safetensors_mmap(safetensors_file_t *s
     flux_cuda_weight_cache_disable(1);
 #endif
 
-    /* Enable bf16 mode if Metal GPU is available */
+    /* Enable bf16 mode if Metal or CUDA GPU is available */
 #ifdef USE_METAL
     tf->use_bf16 = flux_metal_available();
     if (tf->use_bf16) {
         printf("Using bf16 weights for GPU acceleration (mmap mode)\n");
+    }
+#elif defined(USE_CUDA)
+    tf->use_bf16 = flux_cuda_available();
+    if (tf->use_bf16) {
+        printf("Using bf16 weights for CUDA GPU acceleration (mmap mode)\n");
     }
 #else
     tf->use_bf16 = 0;
