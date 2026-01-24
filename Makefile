@@ -137,7 +137,7 @@ cuda: clean cuda-build
 	@echo "Built with CUDA backend (NVIDIA GPU acceleration)"
 	@echo "Using GPU architecture: $(CUDA_ARCH)"
 
-cuda-build: $(SRCS:.c=.cuda.o) flux_cuda.o main.cuda.o
+cuda-build: $(SRCS:.c=.cuda.o) $(CLI_SRCS:.c=.cuda.o) flux_cuda.o main.cuda.o
 	$(CC) $(CUDA_CFLAGS) -o $(TARGET) $^ $(CUDA_LDFLAGS)
 
 %.cuda.o: %.c flux.h flux_kernels.h
