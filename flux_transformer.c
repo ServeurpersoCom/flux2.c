@@ -2839,7 +2839,7 @@ cleanup:
 /* Forward declaration for chained version */
 static int single_block_forward_cuda_chained(int t_hidden,
                                              const single_block_t *block,
-                                             const float *t_emb, const float *adaln_weight,
+                                             const float *shift, const float *scale, const float *gate,
                                              const float *img_rope_cos, const float *img_rope_sin,
                                              const float *txt_rope_cos, const float *txt_rope_sin,
                                              int seq, int img_offset, flux_transformer_t *tf);
@@ -3470,6 +3470,21 @@ float *flux_transformer_forward(flux_transformer_t *tf,
             flux_cuda_tensor_upload(t_hidden_gpu, concat_hidden, sz_hidden);
             cuda_chained_ok = 1;
 
+            /* Pre-compute AdaLN modulation ONCE for all 38 single blocks.
+             * t_emb and adaln_single_weight are the same for all blocks within a step,
+             * so the output (shift, scale, gate) is identical. Computing this 38x was wasteful. */
+            int mod_size = hidden * 3;
+            for (int j = 0; j < hidden; j++) {
+                float x = t_emb[j];
+                tf->t_emb_silu[j] = x / (1.0f + expf(-x));
+            }
+            int fused_dim = hidden * 3 + tf->mlp_hidden * 2;
+            float *mod_params = tf->work2 + total_seq * fused_dim;  /* Place after fused_out buffer */
+            flux_linear_nobias(mod_params, tf->t_emb_silu, tf->adaln_single_weight, 1, hidden, mod_size);
+            float *precomputed_shift = mod_params;
+            float *precomputed_scale = mod_params + hidden;
+            float *precomputed_gate = mod_params + hidden * 2;
+
             /* Process all single blocks with chained GPU tensor */
             for (int i = 0; i < tf->num_single_layers && cuda_chained_ok; i++) {
                 /* In mmap mode, load block weights on-demand */
@@ -3478,7 +3493,7 @@ float *flux_transformer_forward(flux_transformer_t *tf,
                                               tf->hidden_size, tf->mlp_hidden, tf->use_bf16);
                 }
                 if (!single_block_forward_cuda_chained(t_hidden_gpu, &tf->single_blocks[i],
-                                                       t_emb, tf->adaln_single_weight,
+                                                       precomputed_shift, precomputed_scale, precomputed_gate,
                                                        img_rope_cos, img_rope_sin,
                                                        txt_rope_cos, txt_rope_sin,
                                                        total_seq, txt_seq, tf)) {
@@ -4825,7 +4840,7 @@ flux_transformer_t *flux_transformer_load_safetensors_mmap(safetensors_file_t *s
  * Caller must upload before first block and download after last block. */
 static int single_block_forward_cuda_chained(int t_hidden,
                                              const single_block_t *block,
-                                             const float *t_emb, const float *adaln_weight,
+                                             const float *shift, const float *scale, const float *gate,
                                              const float *img_rope_cos, const float *img_rope_sin,
                                              const float *txt_rope_cos, const float *txt_rope_sin,
                                              int seq, int img_offset, flux_transformer_t *tf) {
@@ -4844,21 +4859,9 @@ static int single_block_forward_cuda_chained(int t_hidden,
     float eps = 1e-6f;
     int axis_dim = 32;
 
-    /* === Phase 1: AdaLN modulation (small, CPU) === */
-    int mod_size = h * 3;
-    float *t_emb_silu = tf->t_emb_silu;
-    for (int i = 0; i < h; i++) {
-        float x = t_emb[i];
-        t_emb_silu[i] = x / (1.0f + expf(-x));
-    }
-    float *mod_params = tf->work2 + seq * fused_dim;
-    flux_linear_nobias(mod_params, t_emb_silu, adaln_weight, 1, h, mod_size);
+    /* AdaLN shift/scale/gate are pre-computed by caller (same for all 38 blocks) */
 
-    float *shift = mod_params;
-    float *scale = mod_params + h;
-    float *gate = mod_params + h * 2;
-
-    /* === Phase 2: Allocate GPU tensors (reuse pool) === */
+    /* === Allocate GPU tensors (reuse pool) === */
     size_t sz_h = seq * h * sizeof(float);
     size_t sz_fused = seq * fused_dim * sizeof(float);
     size_t sz_mlp = seq * mlp * sizeof(float);
