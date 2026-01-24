@@ -2836,6 +2836,14 @@ cleanup:
 
 #ifdef USE_CUDA
 /* CUDA-optimized single block: keeps tensors on GPU between operations */
+/* Forward declaration for chained version */
+static int single_block_forward_cuda_chained(int t_hidden,
+                                             const single_block_t *block,
+                                             const float *t_emb, const float *adaln_weight,
+                                             const float *img_rope_cos, const float *img_rope_sin,
+                                             const float *txt_rope_cos, const float *txt_rope_sin,
+                                             int seq, int img_offset, flux_transformer_t *tf);
+
 static int single_block_forward_cuda(float *hidden, const single_block_t *block,
                                      const float *t_emb, const float *adaln_weight,
                                      const float *img_rope_cos, const float *img_rope_sin,
@@ -3449,6 +3457,49 @@ float *flux_transformer_forward(flux_transformer_t *tf,
 
     /* Fall back to per-block GPU/CPU path if both bf16 and f32 chained paths failed */
     if (!bf16_path_ok && !gpu_chained_ok) {
+#endif
+
+#ifdef USE_CUDA
+    /* CUDA chained path - keep hidden on GPU across all single blocks */
+    int cuda_chained_ok = 0;
+    if (flux_cuda_available()) {
+        size_t sz_hidden = (size_t)total_seq * hidden * sizeof(float);
+        int t_hidden_gpu = flux_cuda_tensor_get(sz_hidden);
+        if (t_hidden_gpu >= 0) {
+            /* Upload hidden once */
+            flux_cuda_tensor_upload(t_hidden_gpu, concat_hidden, sz_hidden);
+            cuda_chained_ok = 1;
+
+            /* Process all single blocks with chained GPU tensor */
+            for (int i = 0; i < tf->num_single_layers && cuda_chained_ok; i++) {
+                /* In mmap mode, load block weights on-demand */
+                if (tf->use_mmap) {
+                    load_single_block_weights(&tf->single_blocks[i], tf->sf, i,
+                                              tf->hidden_size, tf->mlp_hidden, tf->use_bf16);
+                }
+                if (!single_block_forward_cuda_chained(t_hidden_gpu, &tf->single_blocks[i],
+                                                       t_emb, tf->adaln_single_weight,
+                                                       img_rope_cos, img_rope_sin,
+                                                       txt_rope_cos, txt_rope_sin,
+                                                       total_seq, txt_seq, tf)) {
+                    cuda_chained_ok = 0;
+                    /* Download current state for fallback */
+                    flux_cuda_tensor_download(t_hidden_gpu, concat_hidden, sz_hidden);
+                    flux_cuda_sync();
+                }
+                if (flux_substep_callback)
+                    flux_substep_callback(FLUX_SUBSTEP_SINGLE_BLOCK, i, tf->num_single_layers);
+            }
+
+            if (cuda_chained_ok) {
+                /* Download final result */
+                flux_cuda_tensor_download(t_hidden_gpu, concat_hidden, sz_hidden);
+                flux_cuda_sync();
+            }
+            flux_cuda_tensor_release(t_hidden_gpu);
+        }
+    }
+    if (!cuda_chained_ok)
 #endif
         for (int i = 0; i < tf->num_single_layers; i++) {
             /* In mmap mode, load block weights on-demand */
@@ -4767,3 +4818,134 @@ flux_transformer_t *flux_transformer_load_safetensors_mmap(safetensors_file_t *s
 
     return tf;
 }
+
+#ifdef USE_CUDA
+/* CUDA-chained single block: operates on a GPU tensor that persists across blocks.
+ * Unlike single_block_forward_cuda(), this does NOT upload/download hidden each call.
+ * Caller must upload before first block and download after last block. */
+static int single_block_forward_cuda_chained(int t_hidden,
+                                             const single_block_t *block,
+                                             const float *t_emb, const float *adaln_weight,
+                                             const float *img_rope_cos, const float *img_rope_sin,
+                                             const float *txt_rope_cos, const float *txt_rope_sin,
+                                             int seq, int img_offset, flux_transformer_t *tf) {
+    if (!flux_cuda_available()) return 0;
+    /* Support both f32 and bf16 weights */
+    int use_bf16 = (block->qkv_mlp_weight_bf16 && block->proj_mlp_weight_bf16);
+    if (!use_bf16 && (!block->qkv_mlp_weight || !block->proj_mlp_weight)) return 0;
+
+    int h = tf->hidden_size;
+    int heads = tf->num_heads;
+    int head_dim = tf->head_dim;
+    int mlp = tf->mlp_hidden;
+    int fused_dim = h * 3 + mlp * 2;
+    int img_seq = seq - img_offset;
+    int txt_seq = img_offset;
+    float eps = 1e-6f;
+    int axis_dim = 32;
+
+    /* === Phase 1: AdaLN modulation (small, CPU) === */
+    int mod_size = h * 3;
+    float *t_emb_silu = tf->t_emb_silu;
+    for (int i = 0; i < h; i++) {
+        float x = t_emb[i];
+        t_emb_silu[i] = x / (1.0f + expf(-x));
+    }
+    float *mod_params = tf->work2 + seq * fused_dim;
+    flux_linear_nobias(mod_params, t_emb_silu, adaln_weight, 1, h, mod_size);
+
+    float *shift = mod_params;
+    float *scale = mod_params + h;
+    float *gate = mod_params + h * 2;
+
+    /* === Phase 2: Allocate GPU tensors (reuse pool) === */
+    size_t sz_h = seq * h * sizeof(float);
+    size_t sz_fused = seq * fused_dim * sizeof(float);
+    size_t sz_mlp = seq * mlp * sizeof(float);
+    size_t sz_concat = seq * (h + mlp) * sizeof(float);
+
+    int t_norm = flux_cuda_tensor_get(sz_h);
+    int t_fused = flux_cuda_tensor_get(sz_fused);
+    int t_q = flux_cuda_tensor_get(sz_h);
+    int t_k = flux_cuda_tensor_get(sz_h);
+    int t_v = flux_cuda_tensor_get(sz_h);
+    int t_gate = flux_cuda_tensor_get(sz_mlp);
+    int t_up = flux_cuda_tensor_get(sz_mlp);
+    int t_attn = flux_cuda_tensor_get(sz_h);
+    int t_concat = flux_cuda_tensor_get(sz_concat);
+    int t_proj = flux_cuda_tensor_get(sz_h);
+
+    if (t_norm < 0 || t_fused < 0 || t_q < 0 || t_k < 0 ||
+        t_v < 0 || t_gate < 0 || t_up < 0 || t_attn < 0 || t_concat < 0 || t_proj < 0) {
+        flux_cuda_tensor_release(t_norm);
+        flux_cuda_tensor_release(t_fused); flux_cuda_tensor_release(t_q);
+        flux_cuda_tensor_release(t_k); flux_cuda_tensor_release(t_v);
+        flux_cuda_tensor_release(t_gate); flux_cuda_tensor_release(t_up);
+        flux_cuda_tensor_release(t_attn); flux_cuda_tensor_release(t_concat);
+        flux_cuda_tensor_release(t_proj);
+        return 0;
+    }
+
+    /* === Phase 3: Run GPU ops (NO upload of hidden - already on GPU) === */
+    flux_cuda_adaln_t(t_norm, t_hidden, shift, scale, seq, h, eps);
+
+    /* Fused QKV+MLP projection */
+    if (use_bf16) {
+        flux_cuda_sgemm_gpu_bf16(0, 1, seq, fused_dim, h, 1.0f, t_norm, h,
+                                 block->qkv_mlp_weight_bf16, h, 0.0f, t_fused, fused_dim);
+    } else {
+        flux_cuda_sgemm_gpu(0, 1, seq, fused_dim, h, 1.0f, t_norm, h,
+                            block->qkv_mlp_weight, h, 0.0f, t_fused, fused_dim);
+    }
+    flux_cuda_split_fused_t(t_fused, t_q, t_k, t_v, t_gate, t_up, seq, h, mlp);
+    flux_cuda_qk_norm_t(t_q, t_k, block->norm_q_weight, block->norm_k_weight,
+                        seq, heads, head_dim, eps);
+
+    /* RoPE on GPU */
+    flux_cuda_rope_offset_t(t_q, txt_rope_cos, txt_rope_sin, txt_seq, 0, heads, head_dim, axis_dim);
+    flux_cuda_rope_offset_t(t_k, txt_rope_cos, txt_rope_sin, txt_seq, 0, heads, head_dim, axis_dim);
+    flux_cuda_rope_offset_t(t_q, img_rope_cos, img_rope_sin, img_seq, txt_seq, heads, head_dim, axis_dim);
+    flux_cuda_rope_offset_t(t_k, img_rope_cos, img_rope_sin, img_seq, txt_seq, heads, head_dim, axis_dim);
+
+    /* GPU attention */
+    float attn_scale = 1.0f / sqrtf((float)head_dim);
+    if (!flux_cuda_attention_t(t_attn, t_q, t_k, t_v, seq, heads, head_dim, attn_scale)) {
+        /* Fallback to CPU attention */
+        float *q_cpu = tf->single_q;
+        float *k_cpu = tf->single_k;
+        float *v_cpu = tf->single_v;
+        float *attn_cpu = tf->single_attn_out;
+        flux_cuda_tensor_download(t_q, q_cpu, sz_h);
+        flux_cuda_tensor_download(t_k, k_cpu, sz_h);
+        flux_cuda_tensor_download(t_v, v_cpu, sz_h);
+        flux_cuda_sync();
+        mha_forward(attn_cpu, q_cpu, k_cpu, v_cpu, seq, heads, head_dim, tf);
+        flux_cuda_tensor_upload(t_attn, attn_cpu, sz_h);
+    }
+
+    /* SwiGLU + concat + proj on GPU */
+    flux_cuda_silu_t(t_gate, seq * mlp);
+    flux_cuda_mul_t(t_gate, t_up, seq * mlp);
+    flux_cuda_concat_t(t_concat, t_attn, t_gate, seq, h, mlp);
+
+    if (use_bf16) {
+        flux_cuda_sgemm_gpu_bf16(0, 1, seq, h, h + mlp, 1.0f, t_concat, h + mlp,
+                                 block->proj_mlp_weight_bf16, h + mlp, 0.0f, t_proj, h);
+    } else {
+        flux_cuda_sgemm_gpu(0, 1, seq, h, h + mlp, 1.0f, t_concat, h + mlp,
+                            block->proj_mlp_weight, h + mlp, 0.0f, t_proj, h);
+    }
+    flux_cuda_gated_add_t(t_hidden, gate, t_proj, seq, h);
+
+    /* NO download - hidden stays on GPU for next block */
+
+    flux_cuda_tensor_release(t_norm);
+    flux_cuda_tensor_release(t_fused); flux_cuda_tensor_release(t_q);
+    flux_cuda_tensor_release(t_k); flux_cuda_tensor_release(t_v);
+    flux_cuda_tensor_release(t_gate); flux_cuda_tensor_release(t_up);
+    flux_cuda_tensor_release(t_attn); flux_cuda_tensor_release(t_concat);
+    flux_cuda_tensor_release(t_proj);
+
+    return 1;
+}
+#endif /* USE_CUDA chained */
