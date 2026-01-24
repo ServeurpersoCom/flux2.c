@@ -701,7 +701,7 @@ int flux_cuda_sgemm_gpu(int ta, int tb, int M, int N, int K,
     return (err == CUBLAS_STATUS_SUCCESS) ? C_id : -1;
 }
 
-/* GPU-to-GPU sgemm with bf16 weights: converts bf16→f32 on GPU, then matmul.
+/* GPU-to-GPU sgemm with bf16 weights: converts bf16->f32 on GPU, then matmul.
  * Uses weight cache to avoid repeated uploads/conversions (mmap mode only).
  * In no-mmap mode, cache is disabled because malloc'd pointers can be reused. */
 int flux_cuda_sgemm_gpu_bf16(int ta, int tb, int M, int N, int K,
