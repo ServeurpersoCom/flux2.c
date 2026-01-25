@@ -21,7 +21,7 @@ LIB = libflux.a
 # Debug build flags
 DEBUG_CFLAGS = -Wall -Wextra -g -O0 -DDEBUG -fsanitize=address
 
-.PHONY: all clean clean-flux clean-all debug lib install info test pngtest help generic blas mps cuda ggml-lib ggml-blas
+.PHONY: all clean clean-flux clean-all debug lib install info test pngtest help generic blas mps cuda ggml-lib ggml-blas test-ggml
 
 # Default: show available targets
 all: help
@@ -276,6 +276,11 @@ ggml-blas-build: $(SRCS:.c=.ggml.o) $(CLI_SRCS:.c=.ggml.o) main.ggml.o
 
 %.ggml.o: %.c flux.h flux_kernels.h
 	$(CC) $(GGML_CFLAGS) -c -o $@ $<
+
+# Test GGML infrastructure
+test-ggml: ggml-lib
+	$(CC) $(GGML_CFLAGS) -o test_ggml test_ggml.c flux_ggml.c $(GGML_LIBS) $(GGML_TARGET_LDFLAGS)
+	./test_ggml
 
 # Clean only flux objects (not GGML)
 clean-flux:
