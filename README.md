@@ -305,14 +305,15 @@ The MPS implementation matches the PyTorch optimized pipeline performance.
 
 | Size | C (MPS) | PyTorch (MPS) |
 |------|---------|---------------|
-| 256x256 | 10.5s | 11s |
-| 512x512 | 13s | 13s |
-| 1024x1024 | 29s | 25s |
+| 256x256 | 8.4s | 11s |
+| 512x512 | 11.7s | 13s |
+| 1024x1024 | 27.9s | 25s |
 
 **Notes:**
 - All times measured as wall clock, including model loading, no warmup. PyTorch times exclude library import overhead (~5-10s) to be fair.
 - The C BLAS backend (CPU) is not shown.
 - The `make generic` backend (pure C, no BLAS) is approximately 30x slower than BLAS and not included in benchmarks.
+- The fastest implementation for Metal remains [the Draw Things app](https://drawthings.ai/) that can produce a 1024x1024 image in just 14 seconds!
 
 ## Resolution Limits
 
