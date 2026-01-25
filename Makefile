@@ -134,10 +134,11 @@ ifneq ($(DETECTED_COMPUTE),)
     CUDA_ARCH ?= sm_$(DETECTED_COMPUTE)
     CUDA_NVCCFLAGS += -arch=$(CUDA_ARCH)
 else
-    # Fat binary: Turing (RTX 2080), Ampere (RTX 3090), Ada (RTX 4090), Blackwell (RTX 5090)
+    # Fat binary: Turing (RTX 2080), Ampere (RTX 3090), Ada (RTX 4090), Hopper (H100), Blackwell (RTX 5090)
     CUDA_NVCCFLAGS += -gencode arch=compute_75,code=sm_75 \
                       -gencode arch=compute_86,code=sm_86 \
                       -gencode arch=compute_89,code=sm_89 \
+                      -gencode arch=compute_90,code=sm_90 \
                       -gencode arch=compute_120,code=sm_120
 endif
 
