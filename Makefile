@@ -21,7 +21,7 @@ LIB = libflux.a
 # Debug build flags
 DEBUG_CFLAGS = -Wall -Wextra -g -O0 -DDEBUG -fsanitize=address
 
-.PHONY: all clean debug lib install info test pngtest help generic blas mps cuda
+.PHONY: all clean clean-flux clean-all debug lib install info test pngtest help generic blas mps cuda ggml-lib ggml-blas
 
 # Default: show available targets
 all: help
@@ -30,22 +30,24 @@ help:
 	@echo "FLUX.2 klein 4B - Build Targets"
 	@echo ""
 	@echo "Choose a backend:"
-	@echo "  make generic  - Pure C, no dependencies (slow)"
-	@echo "  make blas     - With BLAS acceleration (~30x faster)"
+	@echo "  make generic   - Pure C, no dependencies (slow)"
+	@echo "  make blas      - With BLAS acceleration (~30x faster)"
+	@echo "  make ggml-blas - GGML unified backend with BLAS (NEW!)"
 ifeq ($(UNAME_S),Darwin)
 ifeq ($(UNAME_M),arm64)
-	@echo "  make mps      - Apple Silicon with Metal GPU (fastest)"
+	@echo "  make mps       - Apple Silicon with Metal GPU (fastest)"
 endif
 else
-	@echo "  make cuda     - NVIDIA GPU with CUDA/cuBLAS (fastest)"
+	@echo "  make cuda      - NVIDIA GPU with CUDA/cuBLAS (fastest)"
 endif
 	@echo ""
 	@echo "Other targets:"
-	@echo "  make clean    - Remove build artifacts"
-	@echo "  make test     - Run inference test"
-	@echo "  make pngtest  - Compare PNG load on compressed image"
-	@echo "  make info     - Show build configuration"
-	@echo "  make lib      - Build static library"
+	@echo "  make clean     - Remove build artifacts"
+	@echo "  make clean-all - Remove everything including GGML build"
+	@echo "  make test      - Run inference test"
+	@echo "  make pngtest   - Compare PNG load on compressed image"
+	@echo "  make info      - Show build configuration"
+	@echo "  make lib       - Build static library"
 	@echo ""
 ifeq ($(UNAME_S),Darwin)
 	@echo "Example: make mps && ./flux -d flux-klein-model -p \"a cat\" -o cat.png"
@@ -230,6 +232,59 @@ ifdef CUDA_AVAILABLE
 	@echo "  cuda    - NVIDIA GPU (requires CUDA toolkit)"
 endif
 endif
+
+# =============================================================================
+# GGML Backend (unified backend via ggml library)
+# =============================================================================
+GGML_BUILD_DIR = build_ggml
+GGML_LIBS = $(GGML_BUILD_DIR)/src/libggml.a \
+            $(GGML_BUILD_DIR)/src/libggml-base.a \
+            $(GGML_BUILD_DIR)/src/libggml-cpu.a \
+            $(GGML_BUILD_DIR)/src/ggml-blas/libggml-blas.a
+GGML_INCLUDE = -Iggml/include -Iggml/src
+GGML_LDFLAGS = -lopenblas -lgomp -lstdc++ -lpthread
+
+# Build GGML library via CMake (only if not already built)
+$(GGML_BUILD_DIR)/src/libggml.a:
+	@echo "Building GGML library..."
+	@mkdir -p $(GGML_BUILD_DIR)
+	@cd $(GGML_BUILD_DIR) && cmake ../ggml \
+		-DGGML_BLAS=ON \
+		-DGGML_BLAS_VENDOR=OpenBLAS \
+		-DBUILD_SHARED_LIBS=OFF \
+		-DCMAKE_BUILD_TYPE=Release \
+		-DGGML_BUILD_EXAMPLES=OFF \
+		-DGGML_BUILD_TESTS=OFF \
+		>/dev/null 2>&1
+	@cd $(GGML_BUILD_DIR) && make -j$(nproc) ggml ggml-base ggml-cpu ggml-blas >/dev/null 2>&1
+	@echo "GGML library built successfully"
+
+ggml-lib: $(GGML_BUILD_DIR)/src/libggml.a
+
+# Target: ggml-blas (GGML unified backend with BLAS)
+# For now, we also define USE_BLAS to use existing BLAS code path
+# Later we will migrate the kernels to use GGML ops directly
+GGML_CFLAGS = $(CFLAGS_BASE) -DUSE_GGML -DUSE_BLAS -DUSE_OPENBLAS $(GGML_INCLUDE) -I/usr/include/openblas
+GGML_TARGET_LDFLAGS = $(LDFLAGS) $(GGML_LDFLAGS)
+
+ggml-blas: clean-flux ggml-lib ggml-blas-build
+	@echo ""
+	@echo "Built with GGML backend (unified BLAS acceleration)"
+
+ggml-blas-build: $(SRCS:.c=.ggml.o) $(CLI_SRCS:.c=.ggml.o) main.ggml.o
+	$(CC) $(GGML_CFLAGS) -o $(TARGET) $^ $(GGML_LIBS) $(GGML_TARGET_LDFLAGS)
+
+%.ggml.o: %.c flux.h flux_kernels.h
+	$(CC) $(GGML_CFLAGS) -c -o $@ $<
+
+# Clean only flux objects (not GGML)
+clean-flux:
+	rm -f $(OBJS) $(CLI_OBJS) *.mps.o *.cuda.o *.ggml.o flux_metal.o flux_cuda.o main.o $(TARGET) $(LIB)
+	rm -f flux_shaders_source.h
+
+# Clean everything including GGML
+clean-all: clean
+	rm -rf $(GGML_BUILD_DIR)
 
 # =============================================================================
 # Dependencies
