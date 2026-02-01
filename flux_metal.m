@@ -4198,6 +4198,15 @@ static sdpa_graph_cache_t *get_sdpa_graph_cache(int seq_q, int seq_k, int num_he
         return NULL;
     }
 
+    /* Prefer native SDPA (flash attention) when available for long sequences.
+     * Can be disabled for debugging/regression comparisons by setting:
+     *   FLUX_USE_MANUAL_SDPA=1
+     */
+    static int s_force_manual_sdpa = -1;
+    if (s_force_manual_sdpa < 0) {
+        s_force_manual_sdpa = getenv("FLUX_USE_MANUAL_SDPA") ? 1 : 0;
+    }
+
     pthread_mutex_lock(&g_sdpa_graph_mutex);
     for (int i = 0; i < g_sdpa_graph_count; i++) {
         sdpa_graph_cache_t *entry = &g_sdpa_graph_cache[i];
@@ -4245,27 +4254,35 @@ static sdpa_graph_cache_t *get_sdpa_graph_cache(int seq_q, int seq_k, int num_he
 
         MPSGraphTensor *outTensor = nil;
 
-        /* Build attention graph: scaled dot product attention with f32 softmax.
-         *
-         * NOTE: The native scaledDotProductAttention API (macOS 14+) was tested but
-         * showed numerical differences in the output. Until this is resolved, we use
-         * manual attention which passes all regression tests.
-         *
-         * Manual attention: Q @ K^T * scale -> softmax -> @ V
-         * Uses f32 for softmax to maintain precision.
-         */
-        MPSGraphTensor *kTT = [graph transposeTensor:kT dimension:2 withDimension:3 name:nil];
+        if (!s_force_manual_sdpa &&
+            [graph respondsToSelector:@selector(scaledDotProductAttentionWithQueryTensor:keyTensor:valueTensor:scale:name:)]) {
+            /* Native SDPA is significantly more memory-efficient than materializing
+             * the full [heads, seq_q, seq_k] score matrix for long sequences. */
+            MPSGraphTensor *out = [graph scaledDotProductAttentionWithQueryTensor:qT
+                                                                         keyTensor:kT
+                                                                       valueTensor:vT
+                                                                            scale:scale
+                                                                              name:nil];
+            MPSGraphTensor *outCast = [graph castTensor:out toType:MPSDataTypeBFloat16 name:nil];
+            outTensor = [graph transposeTensor:outCast dimension:1 withDimension:2 name:nil];
+        } else {
+            /* Manual attention: Q @ K^T * scale -> softmax -> @ V
+             * Uses f32 for softmax to maintain precision.
+             * Note: this materializes the score matrix and can be very memory-hungry
+             * for large seq lengths. */
+            MPSGraphTensor *kTT = [graph transposeTensor:kT dimension:2 withDimension:3 name:nil];
 
-        MPSGraphTensor *qk = [graph matrixMultiplicationWithPrimaryTensor:qT secondaryTensor:kTT name:nil];
-        MPSGraphTensor *qkF32 = [graph castTensor:qk toType:MPSDataTypeFloat32 name:nil];
-        MPSGraphTensor *scaleTensor = [graph constantWithScalar:scale
-                                                          shape:@[@1]
-                                                       dataType:MPSDataTypeFloat32];
-        MPSGraphTensor *scaled = [graph multiplicationWithPrimaryTensor:qkF32 secondaryTensor:scaleTensor name:nil];
-        MPSGraphTensor *sm = [graph softMaxWithTensor:scaled axis:3 name:nil];
-        MPSGraphTensor *out = [graph matrixMultiplicationWithPrimaryTensor:sm secondaryTensor:vT name:nil];
-        MPSGraphTensor *outCast = [graph castTensor:out toType:MPSDataTypeBFloat16 name:nil];
-        outTensor = [graph transposeTensor:outCast dimension:1 withDimension:2 name:nil];
+            MPSGraphTensor *qk = [graph matrixMultiplicationWithPrimaryTensor:qT secondaryTensor:kTT name:nil];
+            MPSGraphTensor *qkF32 = [graph castTensor:qk toType:MPSDataTypeFloat32 name:nil];
+            MPSGraphTensor *scaleTensor = [graph constantWithScalar:scale
+                                                              shape:@[@1]
+                                                           dataType:MPSDataTypeFloat32];
+            MPSGraphTensor *scaled = [graph multiplicationWithPrimaryTensor:qkF32 secondaryTensor:scaleTensor name:nil];
+            MPSGraphTensor *sm = [graph softMaxWithTensor:scaled axis:3 name:nil];
+            MPSGraphTensor *out = [graph matrixMultiplicationWithPrimaryTensor:sm secondaryTensor:vT name:nil];
+            MPSGraphTensor *outCast = [graph castTensor:out toType:MPSDataTypeBFloat16 name:nil];
+            outTensor = [graph transposeTensor:outCast dimension:1 withDimension:2 name:nil];
+        }
 
         entry->graph = graph;
         entry->qTensor = qIn;
