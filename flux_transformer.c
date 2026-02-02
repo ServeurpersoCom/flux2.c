@@ -257,6 +257,28 @@ typedef struct flux_transformer {
     float *double_img_attn_out;     /* [max_seq, hidden] */
     float *double_txt_attn_out;     /* [max_seq, hidden] */
 
+    /* Cached 2D RoPE embeddings (to avoid malloc/compute each step) */
+    float *cached_img_rope_cos;     /* [img_seq * axis_dim * 4] */
+    float *cached_img_rope_sin;
+    int cached_img_h;
+    int cached_img_w;
+    float *cached_ref_rope_cos;     /* [ref_seq * axis_dim * 4] for img2img */
+    float *cached_ref_rope_sin;
+    int cached_ref_h;
+    int cached_ref_w;
+    int cached_ref_t_offset;
+    float *cached_txt_rope_cos;     /* [txt_seq * head_dim] */
+    float *cached_txt_rope_sin;
+    int cached_txt_seq;
+    /* Combined RoPE cache for img2img (target + reference) */
+    float *cached_combined_rope_cos;  /* [(img_seq + ref_seq) * axis_dim * 4] */
+    float *cached_combined_rope_sin;
+    int cached_combined_img_h;
+    int cached_combined_img_w;
+    int cached_combined_ref_h;
+    int cached_combined_ref_w;
+    int cached_combined_t_offset;
+
     /* Mmap mode: keep safetensors file open, load block weights on-demand */
     int use_mmap;
     safetensors_file_t *sf;
@@ -680,6 +702,156 @@ static void compute_rope_text(float *cos_out, float *sin_out,
             sin_p[axis_dim * 3 + d * 2 + 1] = sin_l;
         }
     }
+}
+
+/* ========================================================================
+ * Cached RoPE Helpers
+ * Cache RoPE embeddings between steps to avoid malloc/compute overhead.
+ * ======================================================================== */
+
+/* Get or compute cached image RoPE for target (T=0) */
+static void get_cached_img_rope(flux_transformer_t *tf, int patch_h, int patch_w,
+                                float **cos_out, float **sin_out) {
+    int seq = patch_h * patch_w;
+    int axis_dim = tf->axis_dim;
+    size_t size = (size_t)seq * axis_dim * 4 * sizeof(float);
+
+    if (tf->cached_img_h == patch_h && tf->cached_img_w == patch_w &&
+        tf->cached_img_rope_cos && tf->cached_img_rope_sin) {
+        /* Cache hit */
+        *cos_out = tf->cached_img_rope_cos;
+        *sin_out = tf->cached_img_rope_sin;
+        return;
+    }
+
+    /* Cache miss - reallocate if needed */
+    if (tf->cached_img_rope_cos) free(tf->cached_img_rope_cos);
+    if (tf->cached_img_rope_sin) free(tf->cached_img_rope_sin);
+    tf->cached_img_rope_cos = (float *)malloc(size);
+    tf->cached_img_rope_sin = (float *)malloc(size);
+    tf->cached_img_h = patch_h;
+    tf->cached_img_w = patch_w;
+
+    compute_rope_2d(tf->cached_img_rope_cos, tf->cached_img_rope_sin,
+                    patch_h, patch_w, axis_dim, tf->rope_theta);
+
+    *cos_out = tf->cached_img_rope_cos;
+    *sin_out = tf->cached_img_rope_sin;
+}
+
+/* Get or compute cached reference image RoPE (with T offset for img2img) */
+static void get_cached_ref_rope(flux_transformer_t *tf, int patch_h, int patch_w,
+                                int t_offset, float **cos_out, float **sin_out) {
+    int seq = patch_h * patch_w;
+    int axis_dim = tf->axis_dim;
+    size_t size = (size_t)seq * axis_dim * 4 * sizeof(float);
+
+    if (tf->cached_ref_h == patch_h && tf->cached_ref_w == patch_w &&
+        tf->cached_ref_t_offset == t_offset &&
+        tf->cached_ref_rope_cos && tf->cached_ref_rope_sin) {
+        /* Cache hit */
+        *cos_out = tf->cached_ref_rope_cos;
+        *sin_out = tf->cached_ref_rope_sin;
+        return;
+    }
+
+    /* Cache miss - reallocate if needed */
+    if (tf->cached_ref_rope_cos) free(tf->cached_ref_rope_cos);
+    if (tf->cached_ref_rope_sin) free(tf->cached_ref_rope_sin);
+    tf->cached_ref_rope_cos = (float *)malloc(size);
+    tf->cached_ref_rope_sin = (float *)malloc(size);
+    tf->cached_ref_h = patch_h;
+    tf->cached_ref_w = patch_w;
+    tf->cached_ref_t_offset = t_offset;
+
+    compute_rope_2d_with_t_offset(tf->cached_ref_rope_cos, tf->cached_ref_rope_sin,
+                                   patch_h, patch_w, axis_dim, tf->rope_theta, t_offset);
+
+    *cos_out = tf->cached_ref_rope_cos;
+    *sin_out = tf->cached_ref_rope_sin;
+}
+
+/* Get or compute cached text RoPE */
+static void get_cached_txt_rope(flux_transformer_t *tf, int txt_seq,
+                                float **cos_out, float **sin_out) {
+    int head_dim = tf->head_dim;
+    size_t size = (size_t)txt_seq * head_dim * sizeof(float);
+
+    if (tf->cached_txt_seq == txt_seq &&
+        tf->cached_txt_rope_cos && tf->cached_txt_rope_sin) {
+        /* Cache hit */
+        *cos_out = tf->cached_txt_rope_cos;
+        *sin_out = tf->cached_txt_rope_sin;
+        return;
+    }
+
+    /* Cache miss - reallocate if needed */
+    if (tf->cached_txt_rope_cos) free(tf->cached_txt_rope_cos);
+    if (tf->cached_txt_rope_sin) free(tf->cached_txt_rope_sin);
+    tf->cached_txt_rope_cos = (float *)malloc(size);
+    tf->cached_txt_rope_sin = (float *)malloc(size);
+    tf->cached_txt_seq = txt_seq;
+
+    compute_rope_text(tf->cached_txt_rope_cos, tf->cached_txt_rope_sin,
+                      txt_seq, tf->axis_dim, tf->rope_theta);
+
+    *cos_out = tf->cached_txt_rope_cos;
+    *sin_out = tf->cached_txt_rope_sin;
+}
+
+/* Get or compute cached combined RoPE for img2img (target + reference) */
+static void get_cached_combined_rope(flux_transformer_t *tf,
+                                     int img_h, int img_w,
+                                     int ref_h, int ref_w,
+                                     int t_offset,
+                                     float **cos_out, float **sin_out) {
+    int img_seq = img_h * img_w;
+    int ref_seq = ref_h * ref_w;
+    int combined_seq = img_seq + ref_seq;
+    int axis_dim = tf->axis_dim;
+    size_t combined_size = (size_t)combined_seq * axis_dim * 4 * sizeof(float);
+    size_t img_size = (size_t)img_seq * axis_dim * 4 * sizeof(float);
+    size_t ref_size = (size_t)ref_seq * axis_dim * 4 * sizeof(float);
+
+    if (tf->cached_combined_img_h == img_h &&
+        tf->cached_combined_img_w == img_w &&
+        tf->cached_combined_ref_h == ref_h &&
+        tf->cached_combined_ref_w == ref_w &&
+        tf->cached_combined_t_offset == t_offset &&
+        tf->cached_combined_rope_cos && tf->cached_combined_rope_sin) {
+        /* Cache hit */
+        *cos_out = tf->cached_combined_rope_cos;
+        *sin_out = tf->cached_combined_rope_sin;
+        return;
+    }
+
+    /* Cache miss - reallocate if needed */
+    if (tf->cached_combined_rope_cos) free(tf->cached_combined_rope_cos);
+    if (tf->cached_combined_rope_sin) free(tf->cached_combined_rope_sin);
+    tf->cached_combined_rope_cos = (float *)malloc(combined_size);
+    tf->cached_combined_rope_sin = (float *)malloc(combined_size);
+    tf->cached_combined_img_h = img_h;
+    tf->cached_combined_img_w = img_w;
+    tf->cached_combined_ref_h = ref_h;
+    tf->cached_combined_ref_w = ref_w;
+    tf->cached_combined_t_offset = t_offset;
+
+    /* Compute target image RoPE (T=0) */
+    float *img_rope_cos, *img_rope_sin;
+    get_cached_img_rope(tf, img_h, img_w, &img_rope_cos, &img_rope_sin);
+
+    /* Compute reference image RoPE (T=t_offset) */
+    float *ref_rope_cos, *ref_rope_sin;
+    get_cached_ref_rope(tf, ref_h, ref_w, t_offset, &ref_rope_cos, &ref_rope_sin);
+
+    /* Concatenate: [target, reference] */
+    memcpy(tf->cached_combined_rope_cos, img_rope_cos, img_size);
+    memcpy(tf->cached_combined_rope_cos + img_seq * axis_dim * 4, ref_rope_cos, ref_size);
+    memcpy(tf->cached_combined_rope_sin, img_rope_sin, img_size);
+    memcpy(tf->cached_combined_rope_sin + img_seq * axis_dim * 4, ref_rope_sin, ref_size);
+
+    *cos_out = tf->cached_combined_rope_cos;
+    *sin_out = tf->cached_combined_rope_sin;
 }
 
 /* ========================================================================
@@ -2777,8 +2949,6 @@ float *flux_transformer_forward(flux_transformer_t *tf,
                                 float timestep) {
     int hidden = tf->hidden_size;
     int img_seq = img_h * img_w;
-    int head_dim = tf->head_dim;
-    int axis_dim = 32;  /* FLUX uses axes_dims_rope: [32, 32, 32, 32] */
 
     /* Ensure work buffers are sized for actual sequence length */
     int total_seq = img_seq + txt_seq;
@@ -2801,20 +2971,13 @@ float *flux_transformer_forward(flux_transformer_t *tf,
     get_timestep_embedding(t_sincos, timestep * 1000.0f, sincos_dim, 10000.0f);
     time_embed_forward(t_emb, t_sincos, &tf->time_embed, hidden, tf->t_emb_silu);
 
-    /* Compute 2D RoPE frequencies for image tokens based on actual dimensions
-     * img_h, img_w are the patch grid dimensions (e.g., 4x4 for 64x64 image)
-     */
-    /* Allocate RoPE: 4 axes * 32 dims = 128 dims per position (matches head_dim) */
-    float *img_rope_cos = (float *)malloc(img_seq * axis_dim * 4 * sizeof(float));
-    float *img_rope_sin = (float *)malloc(img_seq * axis_dim * 4 * sizeof(float));
-    compute_rope_2d(img_rope_cos, img_rope_sin, img_h, img_w, axis_dim, tf->rope_theta);
+    /* Get cached 2D RoPE frequencies for image tokens */
+    float *img_rope_cos, *img_rope_sin;
+    get_cached_img_rope(tf, img_h, img_w, &img_rope_cos, &img_rope_sin);
 
-    /* Compute text RoPE frequencies - text tokens have position IDs (0, 0, 0, L)
-     * where L is the sequence index. RoPE is applied in axis 3 (dims 96-127)
-     */
-    float *txt_rope_cos = (float *)malloc(txt_seq * head_dim * sizeof(float));
-    float *txt_rope_sin = (float *)malloc(txt_seq * head_dim * sizeof(float));
-    compute_rope_text(txt_rope_cos, txt_rope_sin, txt_seq, axis_dim, tf->rope_theta);
+    /* Get cached text RoPE frequencies */
+    float *txt_rope_cos, *txt_rope_sin;
+    get_cached_txt_rope(tf, txt_seq, &txt_rope_cos, &txt_rope_sin);
 
     /* Transpose input from NCHW [channels, h, w] to NLC [seq, channels] format
      * Input: img_latent[c * img_seq + pos] for channel c at position pos
@@ -2845,10 +3008,7 @@ float *flux_transformer_forward(flux_transformer_t *tf,
         if (bf16_output) {
             free(img_transposed);
             free(t_emb);
-            free(img_rope_cos);
-            free(img_rope_sin);
-            free(txt_rope_cos);
-            free(txt_rope_sin);
+            /* RoPE buffers are cached in transformer struct - don't free */
             return bf16_output;
         } else {
             BF16_DEBUG("[BF16] bf16 pipeline failed, falling back\n");
@@ -3220,10 +3380,7 @@ float *flux_transformer_forward(flux_transformer_t *tf,
     free(output_nlc);
 
     free(t_emb);
-    free(img_rope_cos);
-    free(img_rope_sin);
-    free(txt_rope_cos);
-    free(txt_rope_sin);
+    /* RoPE buffers are cached in the transformer and freed in flux_transformer_free(). */
 
     double final_time = tf_get_time_ms() - final_start;
 
@@ -3288,8 +3445,6 @@ float *flux_transformer_forward_with_refs(flux_transformer_t *tf,
     int img_seq = img_h * img_w;
     int ref_seq = ref_h * ref_w;
     int combined_img_seq = img_seq + ref_seq;  /* Target + reference */
-    int head_dim = tf->head_dim;
-    int axis_dim = 32;
     int channels = tf->latent_channels;
 
     /* Ensure work buffers are sized for combined sequence */
@@ -3310,34 +3465,14 @@ float *flux_transformer_forward_with_refs(flux_transformer_t *tf,
     get_timestep_embedding(t_sincos, timestep * 1000.0f, sincos_dim, 10000.0f);
     time_embed_forward(t_emb, t_sincos, &tf->time_embed, hidden, tf->t_emb_silu);
 
-    /* Compute RoPE for target image (T=0) */
-    float *img_rope_cos = (float *)malloc(img_seq * axis_dim * 4 * sizeof(float));
-    float *img_rope_sin = (float *)malloc(img_seq * axis_dim * 4 * sizeof(float));
-    compute_rope_2d(img_rope_cos, img_rope_sin, img_h, img_w, axis_dim, tf->rope_theta);
+    /* Get cached combined RoPE for img2img (target + reference) */
+    float *combined_rope_cos, *combined_rope_sin;
+    get_cached_combined_rope(tf, img_h, img_w, ref_h, ref_w, t_offset,
+                             &combined_rope_cos, &combined_rope_sin);
 
-    /* Compute RoPE for reference image (T=t_offset) */
-    float *ref_rope_cos = (float *)malloc(ref_seq * axis_dim * 4 * sizeof(float));
-    float *ref_rope_sin = (float *)malloc(ref_seq * axis_dim * 4 * sizeof(float));
-    compute_rope_2d_with_t_offset(ref_rope_cos, ref_rope_sin, ref_h, ref_w,
-                                   axis_dim, tf->rope_theta, t_offset);
-
-    /* Concatenate RoPE: [target, reference] */
-    float *combined_rope_cos = (float *)malloc(combined_img_seq * axis_dim * 4 * sizeof(float));
-    float *combined_rope_sin = (float *)malloc(combined_img_seq * axis_dim * 4 * sizeof(float));
-    memcpy(combined_rope_cos, img_rope_cos, img_seq * axis_dim * 4 * sizeof(float));
-    memcpy(combined_rope_cos + img_seq * axis_dim * 4, ref_rope_cos, ref_seq * axis_dim * 4 * sizeof(float));
-    memcpy(combined_rope_sin, img_rope_sin, img_seq * axis_dim * 4 * sizeof(float));
-    memcpy(combined_rope_sin + img_seq * axis_dim * 4, ref_rope_sin, ref_seq * axis_dim * 4 * sizeof(float));
-
-    free(img_rope_cos);
-    free(img_rope_sin);
-    free(ref_rope_cos);
-    free(ref_rope_sin);
-
-    /* Compute text RoPE */
-    float *txt_rope_cos = (float *)malloc(txt_seq * head_dim * sizeof(float));
-    float *txt_rope_sin = (float *)malloc(txt_seq * head_dim * sizeof(float));
-    compute_rope_text(txt_rope_cos, txt_rope_sin, txt_seq, axis_dim, tf->rope_theta);
+    /* Get cached text RoPE */
+    float *txt_rope_cos, *txt_rope_sin;
+    get_cached_txt_rope(tf, txt_seq, &txt_rope_cos, &txt_rope_sin);
 
     /* Transpose and concatenate image latents: [target, reference] */
     float *combined_transposed = (float *)malloc(combined_img_seq * channels * sizeof(float));
@@ -3373,10 +3508,7 @@ float *flux_transformer_forward_with_refs(flux_transformer_t *tf,
         if (bf16_output) {
             free(combined_transposed);
             free(t_emb);
-            free(combined_rope_cos);
-            free(combined_rope_sin);
-            free(txt_rope_cos);
-            free(txt_rope_sin);
+            /* RoPE buffers are cached in transformer struct - don't free */
             return bf16_output;
         } else {
             BF16_DEBUG("[BF16] bf16 pipeline failed for refs, falling back\n");
@@ -3486,10 +3618,7 @@ float *flux_transformer_forward_with_refs(flux_transformer_t *tf,
     free(output_nlc);
 
     free(t_emb);
-    free(combined_rope_cos);
-    free(combined_rope_sin);
-    free(txt_rope_cos);
-    free(txt_rope_sin);
+    /* RoPE buffers are cached in the transformer and freed in flux_transformer_free(). */
 
     if (flux_substep_callback)
         flux_substep_callback(FLUX_SUBSTEP_FINAL_LAYER, 0, 1);
@@ -3536,7 +3665,6 @@ float *flux_transformer_forward_with_multi_refs(flux_transformer_t *tf,
 
     int hidden = tf->hidden_size;
     int img_seq = img_h * img_w;
-    int head_dim = tf->head_dim;
     int axis_dim = 32;
     int channels = tf->latent_channels;
 
@@ -3584,10 +3712,9 @@ float *flux_transformer_forward_with_multi_refs(flux_transformer_t *tf,
         rope_offset += ref_seq * axis_dim * 4;
     }
 
-    /* Compute text RoPE */
-    float *txt_rope_cos = (float *)malloc(txt_seq * head_dim * sizeof(float));
-    float *txt_rope_sin = (float *)malloc(txt_seq * head_dim * sizeof(float));
-    compute_rope_text(txt_rope_cos, txt_rope_sin, txt_seq, axis_dim, tf->rope_theta);
+    /* Get cached text RoPE */
+    float *txt_rope_cos, *txt_rope_sin;
+    get_cached_txt_rope(tf, txt_seq, &txt_rope_cos, &txt_rope_sin);
 
     /* Transpose and concatenate all image latents */
     float *combined_transposed = (float *)malloc(combined_img_seq * channels * sizeof(float));
@@ -3630,8 +3757,7 @@ float *flux_transformer_forward_with_multi_refs(flux_transformer_t *tf,
             free(t_emb);
             free(combined_rope_cos);
             free(combined_rope_sin);
-            free(txt_rope_cos);
-            free(txt_rope_sin);
+            /* txt_rope is cached - don't free */
             return bf16_output;
         } else {
             BF16_DEBUG("[BF16] bf16 pipeline failed for multi-refs, falling back\n");
@@ -3741,8 +3867,7 @@ float *flux_transformer_forward_with_multi_refs(flux_transformer_t *tf,
     free(t_emb);
     free(combined_rope_cos);
     free(combined_rope_sin);
-    free(txt_rope_cos);
-    free(txt_rope_sin);
+    /* Text RoPE buffers are cached in the transformer and freed in flux_transformer_free(). */
 
     if (flux_substep_callback)
         flux_substep_callback(FLUX_SUBSTEP_FINAL_LAYER, 0, 1);
@@ -4002,6 +4127,16 @@ void flux_transformer_free(flux_transformer_t *tf) {
     free(tf->double_mod_txt);
     free(tf->double_img_attn_out);
     free(tf->double_txt_attn_out);
+
+    /* Free cached RoPE buffers */
+    free(tf->cached_img_rope_cos);
+    free(tf->cached_img_rope_sin);
+    free(tf->cached_ref_rope_cos);
+    free(tf->cached_ref_rope_sin);
+    free(tf->cached_txt_rope_cos);
+    free(tf->cached_txt_rope_sin);
+    free(tf->cached_combined_rope_cos);
+    free(tf->cached_combined_rope_sin);
 
     /* Close safetensors file if in mmap mode */
     if (tf->use_mmap && tf->sf) {
