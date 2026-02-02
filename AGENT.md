@@ -69,7 +69,7 @@ This project implements three different targets:
 # Development rules
 
 - We don't add any dependency to this project. Even the PNG and JPG support is implemented internally. The only acceptable dependencies are the blas / openblas library and the Metal primitives that are part of MacOS.
-- Don't accept speed improvements that are just marginal, like 1%: they may be just random fluctations among runs. Refuse small speed improvements especially if they make the code much slower.
+- Don't accept speed improvements that are just marginal, like 1%: they may be just random fluctations among runs. Refuse small speed improvements especially if they make the code more complicated, however more complex code for important speed improvements is ok.
 - Always test a code modification after implementing it, using `make test`
 - Once you reach a positive result, commit it.
 - Never add or commit unstaged files, unless you created them for a specific purpose.
